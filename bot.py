@@ -10,7 +10,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")   # matches Railway variable
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
@@ -36,10 +36,6 @@ def _allowed_bookmaker(title: str) -> bool:
     return any(key in (title or "").lower() for key in ALLOWED_BOOKMAKER_KEYS)
 
 def fetch_odds():
-    """
-    Pull both short-term (upcoming) and long-term (specific sports) odds
-    so we can fill Quick Return and Long Play channels.
-    """
     base_url = "https://api.the-odds-api.com/v4"
     all_data = []
 
@@ -134,16 +130,25 @@ def calculate_bets(data):
                     if edge <= 0:
                         continue
 
-                    # Stakes
+                    # Conservative stake (flat 1.5%)
                     cons_stake = round(BANKROLL * CONSERVATIVE_PCT, 2)
+
+                    # Smart Stake (dynamic, capped 0.5%–3% of bankroll)
+                    kelly_fraction = (consensus_p - implied_p) / implied_p if implied_p > 0 else 0
+                    smart_pct = max(0.005, min(0.03, kelly_fraction))
+                    smart_stake = round(BANKROLL * smart_pct, 2)
+
+                    # Aggressive stake (scaled-up cons)
                     agg_stake = round(cons_stake * (1 + (edge*100)), 2)
 
                     # Payouts
                     cons_payout = round(cons_stake * price, 2)
+                    smart_payout = round(smart_stake * price, 2)
                     agg_payout = round(agg_stake * price, 2)
 
                     # Expected Profits
                     cons_exp_profit = round(consensus_p * cons_payout - cons_stake, 2)
+                    smart_exp_profit = round(consensus_p * smart_payout - smart_stake, 2)
                     agg_exp_profit = round(consensus_p * agg_payout - agg_stake, 2)
 
                     bets.append({
@@ -156,10 +161,13 @@ def calculate_bets(data):
                         "consensus": round(consensus_p*100, 2),
                         "edge": round(edge*100, 2),
                         "cons_stake": cons_stake,
+                        "smart_stake": smart_stake,
                         "agg_stake": agg_stake,
                         "cons_payout": cons_payout,
+                        "smart_payout": smart_payout,
                         "agg_payout": agg_payout,
                         "cons_exp_profit": cons_exp_profit,
+                        "smart_exp_profit": smart_exp_profit,
                         "agg_exp_profit": agg_exp_profit,
                         "quick_return": delta <= timedelta(hours=48),
                         "long_play": timedelta(hours=48) < delta <= timedelta(days=150)
@@ -182,6 +190,7 @@ def format_bet(b, title, color):
         f"**Edge:** {b['edge']}%\n"
         f"**Time:** {b['time']}\n\n"
         f"💵 **Conservative Stake:** ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
+        f"📊 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
         f"💰 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
     )
     return discord.Embed(title=title, description=description, color=color)
@@ -250,6 +259,7 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
+
 
 
 
