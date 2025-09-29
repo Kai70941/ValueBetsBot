@@ -10,7 +10,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")   # ✅ fixed
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")   # matches Railway variable
 
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
@@ -36,20 +36,56 @@ def _allowed_bookmaker(title: str) -> bool:
     return any(key in (title or "").lower() for key in ALLOWED_BOOKMAKER_KEYS)
 
 def fetch_odds():
-    url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
-    params = {
-        "apiKey": ODDS_API_KEY,   # ✅ fixed
-        "regions": "au,us,uk",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "decimal"
-    }
+    """
+    Pull both short-term (upcoming) and long-term (specific sports) odds
+    so we can fill Quick Return and Long Play channels.
+    """
+    base_url = "https://api.the-odds-api.com/v4"
+    all_data = []
+
+    # 1. Get short-term "upcoming" bets
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(
+            f"{base_url}/sports/upcoming/odds",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": "au,us,uk",
+                "markets": "h2h,spreads,totals",
+                "oddsFormat": "decimal"
+            },
+            timeout=10
+        )
         resp.raise_for_status()
-        return resp.json()
+        all_data.extend(resp.json())
     except Exception as e:
-        print("❌ Odds API error:", e)
-        return []
+        print("❌ Odds API upcoming error:", e)
+
+    # 2. Get long-term bets from specific sports
+    long_term_sports = [
+        "soccer_epl", 
+        "americanfootball_nfl", 
+        "basketball_nba", 
+        "tennis_atp_wimbledon"
+    ]
+
+    for sport in long_term_sports:
+        try:
+            resp = requests.get(
+                f"{base_url}/sports/{sport}/odds",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "au,us,uk",
+                    "markets": "h2h,spreads,totals",
+                    "oddsFormat": "decimal"
+                },
+                timeout=10
+            )
+            resp.raise_for_status()
+            all_data.extend(resp.json())
+        except Exception as e:
+            print(f"⚠️ Skipping {sport}: {e}")
+
+    return all_data
 
 def calculate_bets(data):
     now = datetime.now(timezone.utc)
@@ -214,6 +250,7 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
+
 
 
 
