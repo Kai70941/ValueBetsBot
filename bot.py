@@ -15,7 +15,7 @@ BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL")  # ✅ use public URL for Railway
+DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL")
 
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
@@ -39,7 +39,11 @@ def init_db():
         edge FLOAT,
         bet_time TIMESTAMP,
         category TEXT,
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at TIMESTAMP DEFAULT NOW(),
+        result TEXT DEFAULT 'pending',
+        cons_profit FLOAT DEFAULT 0,
+        smart_profit FLOAT DEFAULT 0,
+        agg_profit FLOAT DEFAULT 0
     )
     """)
     conn.commit()
@@ -59,7 +63,7 @@ def save_bet_to_db(bet, category):
             bet['team'],
             bet['odds'],
             bet['edge'],
-            bet['time_raw'],   # ✅ proper datetime for Postgres
+            bet['time_raw'],
             category,
             datetime.utcnow()
         ))
@@ -94,7 +98,7 @@ def fetch_odds():
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "au,us,uk",
-        "markets": "h2h,spreads,totals",
+        "markets": "h2h",
         "oddsFormat": "decimal"
     }
     try:
@@ -103,6 +107,17 @@ def fetch_odds():
         return resp.json()
     except Exception as e:
         print("❌ Odds API error:", e)
+        return []
+
+def fetch_scores():
+    url = "https://api.the-odds-api.com/v4/sports/upcoming/scores/"
+    params = {"apiKey": ODDS_API_KEY, "daysFrom": 3}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("❌ Scores API error:", e)
         return []
 
 # ---------------------------
@@ -156,58 +171,102 @@ def calculate_bets(data):
                         continue
 
                     cons_stake = round(BANKROLL * CONSERVATIVE_PCT, 2)
-                    smart_stake = round(cons_stake * (edge*100/10), 2)  # hybrid smart
+                    smart_stake = round(cons_stake * (edge*100/10), 2)
                     agg_stake = round(cons_stake * (1 + (edge*100)), 2)
-
-                    cons_payout = round(cons_stake * price, 2)
-                    smart_payout = round(smart_stake * price, 2)
-                    agg_payout = round(agg_stake * price, 2)
-
-                    cons_exp_profit = round(consensus_p * cons_payout - cons_stake, 2)
-                    smart_exp_profit = round(consensus_p * smart_payout - smart_stake, 2)
-                    agg_exp_profit = round(consensus_p * agg_payout - agg_stake, 2)
 
                     bets.append({
                         "match": match_name,
                         "bookmaker": title,
                         "team": name,
                         "odds": price,
-                        "time": commence_dt.strftime("%d/%m/%y %H:%M"),  # for Discord
-                        "time_raw": commence_dt,                        # ✅ for DB
-                        "probability": round(implied_p*100, 2),
-                        "consensus": round(consensus_p*100, 2),
-                        "edge": round(edge*100, 2),
+                        "time": commence_dt.strftime("%d/%m/%y %H:%M"),
+                        "time_raw": commence_dt,
                         "cons_stake": cons_stake,
-                        "agg_stake": agg_stake,
                         "smart_stake": smart_stake,
-                        "cons_payout": cons_payout,
-                        "agg_payout": agg_payout,
-                        "smart_payout": smart_payout,
-                        "cons_exp_profit": cons_exp_profit,
-                        "agg_exp_profit": agg_exp_profit,
-                        "smart_exp_profit": smart_exp_profit,
+                        "agg_stake": agg_stake,
                         "quick_return": delta <= timedelta(hours=48),
                         "long_play": timedelta(hours=48) < delta <= timedelta(days=150)
                     })
     return bets
 
 # ---------------------------
+# ROI & Results Updater
+# ---------------------------
+def update_results():
+    scores = fetch_scores()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM bets WHERE result = 'pending'")
+    rows = cur.fetchall()
+
+    for row in rows:
+        match = row['match']
+        team_pick = row['team']
+
+        # Find matching score event
+        for event in scores:
+            if match.lower() in (f"{event.get('home_team','')} vs {event.get('away_team','')}").lower():
+                if not event.get("completed", False):
+                    continue
+                scores_list = event.get("scores", [])
+                if not scores_list or len(scores_list) < 2:
+                    continue
+
+                home = scores_list[0]
+                away = scores_list[1]
+
+                try:
+                    home_score = int(home['score'])
+                    away_score = int(away['score'])
+                except:
+                    continue
+
+                winner = home['name'] if home_score > away_score else away['name']
+                result = "win" if team_pick == winner else "loss"
+
+                cons_profit = ((row['odds'] * row['cons_stake']) - row['cons_stake']) if result == "win" else -row['cons_stake']
+                smart_profit = ((row['odds'] * row['smart_stake']) - row['smart_stake']) if result == "win" else -row['smart_stake']
+                agg_profit = ((row['odds'] * row['agg_stake']) - row['agg_stake']) if result == "win" else -row['agg_stake']
+
+                cur.execute("""
+                    UPDATE bets
+                    SET result=%s, cons_profit=%s, smart_profit=%s, agg_profit=%s
+                    WHERE id=%s
+                """, (result, cons_profit, smart_profit, agg_profit, row['id']))
+                break
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def calculate_roi():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT SUM(cons_profit) as cons, SUM(smart_profit) as smart, SUM(agg_profit) as agg FROM bets WHERE result != 'pending'")
+    totals = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FILTER (WHERE result='win') as wins, COUNT(*) FILTER (WHERE result='loss') as losses FROM bets WHERE result != 'pending'")
+    counts = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    roi_cons = round((totals['cons'] / abs(totals['cons']))*100, 2) if totals['cons'] else 0
+    roi_smart = round((totals['smart'] / abs(totals['smart']))*100, 2) if totals['smart'] else 0
+    roi_agg = round((totals['agg'] / abs(totals['agg']))*100, 2) if totals['agg'] else 0
+
+    return roi_cons, roi_smart, roi_agg, counts['wins'], counts['losses']
+
+# ---------------------------
 # Format Embed
 # ---------------------------
 def format_bet(b, title, color):
-    indicator = "🟢 Value Bet" if b['edge'] >= 2 else "🛑 Low Value"
     description = (
-        f"{indicator}\n\n"
         f"**Match:** {b['match']}\n"
         f"**Pick:** {b['team']} @ {b['odds']}\n"
         f"**Bookmaker:** {b['bookmaker']}\n"
-        f"**Consensus %:** {b['consensus']}%\n"
-        f"**Implied %:** {b['probability']}%\n"
-        f"**Edge:** {b['edge']}%\n"
         f"**Time:** {b['time']}\n\n"
-        f"💵 **Conservative Stake:** ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
-        f"🧠 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
-        f"🔥 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
+        f"💵 Cons Stake: ${b['cons_stake']}\n"
+        f"🧠 Smart Stake: ${b['smart_stake']}\n"
+        f"🔥 Agg Stake: ${b['agg_stake']}\n"
     )
     return discord.Embed(title=title, description=description, color=color)
 
@@ -221,8 +280,8 @@ async def post_bets(bets):
     if not bets:
         return
 
-    best = max(bets, key=lambda x: (x["consensus"], x["edge"]))
-    if bet_id(best) not in posted_bets:
+    best = max(bets, key=lambda x: x["edge"]) if bets else None
+    if best and bet_id(best) not in posted_bets:
         posted_bets.add(bet_id(best))
         save_bet_to_db(best, "best")
         channel = bot.get_channel(BEST_BETS_CHANNEL)
@@ -262,45 +321,27 @@ async def on_ready():
     if not bet_loop.is_running():
         bet_loop.start()
 
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=60)  # fetch less frequently for scores
 async def bet_loop():
     data = fetch_odds()
     bets = calculate_bets(data)
     await post_bets(bets)
+    update_results()
 
 # ---------------------------
 # Commands
 # ---------------------------
-@bot.tree.command(name="fetchbets", description="Preview current bets (no posting)")
-async def fetch_bets_cmd(interaction: discord.Interaction):
-    data = fetch_odds()
-    bets = calculate_bets(data)
-    if not bets:
-        await interaction.response.send_message("⚠️ No bets right now.")
-        return
-    preview = "\n\n".join([f"**{b['match']}**\n{b['team']} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%" for b in bets[:5]])
-    await interaction.response.send_message(f"🎲 Bets Preview:\n\n{preview}")
-
-@bot.tree.command(name="stats", description="Show database stats")
-async def stats_cmd(interaction: discord.Interaction):
-    try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT category, COUNT(*) as count FROM bets GROUP BY category")
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if not rows:
-            await interaction.response.send_message("📊 No bets saved yet.")
-            return
-
-        msg = "📊 **Bets saved so far:**\n"
-        for row in rows:
-            msg += f"- {row['category']}: {row['count']} bets\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error fetching stats: {e}")
+@bot.tree.command(name="roi", description="Show ROI for all time")
+async def roi_cmd(interaction: discord.Interaction):
+    roi_cons, roi_smart, roi_agg, wins, losses = calculate_roi()
+    msg = (
+        f"📊 **ROI Report (All Time)**\n"
+        f"Conservative: {roi_cons}%\n"
+        f"Smart: {roi_smart}%\n"
+        f"Aggressive: {roi_agg}%\n\n"
+        f"Total: {wins} Wins / {losses} Losses"
+    )
+    await interaction.response.send_message(msg)
 
 # ---------------------------
 # Run
