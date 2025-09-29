@@ -10,7 +10,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
-ODDS_API_KEY = os.getenv("THEODDS_API_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")   # ✅ fixed
 
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
@@ -36,41 +36,20 @@ def _allowed_bookmaker(title: str) -> bool:
     return any(key in (title or "").lower() for key in ALLOWED_BOOKMAKER_KEYS)
 
 def fetch_odds():
-    """
-    Pull ALL sports odds, not just 'upcoming'.
-    This allows both quick-return bets (within 48h)
-    and long-term bets (up to 150 days) to come through.
-    """
-    url = "https://api.the-odds-api.com/v4/sports/"
+    url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
+    params = {
+        "apiKey": ODDS_API_KEY,   # ✅ fixed
+        "regions": "au,us,uk",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "decimal"
+    }
     try:
-        sports_resp = requests.get(url, params={"apiKey": ODDS_API_KEY}, timeout=10)
-        sports_resp.raise_for_status()
-        sports = sports_resp.json()
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        print("❌ Odds API sports fetch error:", e)
+        print("❌ Odds API error:", e)
         return []
-
-    all_odds = []
-    for sport in sports:
-        sport_key = sport.get("key")
-        if not sport_key:
-            continue
-        odds_url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
-        params = {
-            "apiKey": ODDS_API_KEY,
-            "regions": "au,us,uk",
-            "markets": "h2h,spreads,totals",
-            "oddsFormat": "decimal"
-        }
-        try:
-            resp = requests.get(odds_url, params=params, timeout=10)
-            resp.raise_for_status()
-            all_odds.extend(resp.json())
-        except Exception as e:
-            print(f"⚠️ Skipping {sport_key}: {e}")
-            continue
-
-    return all_odds
 
 def calculate_bets(data):
     now = datetime.now(timezone.utc)
@@ -152,7 +131,6 @@ def calculate_bets(data):
     return bets
 
 def format_bet(b, title, color):
-    # Value indicator
     if b['edge'] >= 2:
         indicator = "🟢 Value Bet"
     else:
@@ -236,5 +214,6 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
+
 
 
