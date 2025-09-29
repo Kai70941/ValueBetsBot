@@ -20,66 +20,76 @@ DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL")
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
 
+# ---------------------------
+# Sport Emojis
+# ---------------------------
+SPORT_EMOJIS = {
+    "soccer": "⚽ Football",
+    "basketball": "🏀 Basketball",
+    "americanfootball": "🏈 American Football",
+    "tennis": "🎾 Tennis",
+    "baseball": "⚾ Baseball",
+    "icehockey": "🏒 Ice Hockey",
+    "mma": "🥊 MMA / UFC",
+    "boxing": "🥊 Boxing",
+    "cricket": "🏏 Cricket",
+    "golf": "⛳ Golf",
+    "esports": "🎮 Esports",
+    "rugby": "🏉 Rugby",
+    "tabletennis": "🏓 Table Tennis",
+    "volleyball": "🏐 Volleyball",
+    "handball": "🤾 Handball",
+    "snooker": "🎱 Snooker",
+    "cycling": "🚴 Cycling",
+    "motorsport": "🏎️ Motorsport",
+    "f1": "🏎️ Formula 1",
+}
+
+# ---------------------------
 # Bot setup
+# ---------------------------
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 posted_bets = set()
 
 # ---------------------------
-# Database Helpers
+# Database helpers
 # ---------------------------
 def get_db_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
 
-def migrate_db():
+def init_db():
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
-        ALTER TABLE bets 
-            ADD COLUMN IF NOT EXISTS consensus NUMERIC,
-            ADD COLUMN IF NOT EXISTS implied NUMERIC,
-            ADD COLUMN IF NOT EXISTS cons_stake NUMERIC,
-            ADD COLUMN IF NOT EXISTS cons_payout NUMERIC,
-            ADD COLUMN IF NOT EXISTS cons_profit NUMERIC,
-            ADD COLUMN IF NOT EXISTS smart_stake NUMERIC,
-            ADD COLUMN IF NOT EXISTS smart_payout NUMERIC,
-            ADD COLUMN IF NOT EXISTS smart_profit NUMERIC,
-            ADD COLUMN IF NOT EXISTS agg_stake NUMERIC,
-            ADD COLUMN IF NOT EXISTS agg_payout NUMERIC,
-            ADD COLUMN IF NOT EXISTS agg_profit NUMERIC,
-            ADD COLUMN IF NOT EXISTS sport_key TEXT;
+        CREATE TABLE IF NOT EXISTS bets (
+            id SERIAL PRIMARY KEY,
+            match TEXT,
+            bookmaker TEXT,
+            team TEXT,
+            odds FLOAT,
+            edge FLOAT,
+            bet_time TIMESTAMP,
+            category TEXT,
+            sport TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
     """)
     conn.commit()
     cur.close()
     conn.close()
-    print("✅ Migration complete")
 
 def save_bet(bet):
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO bets (match, bookmaker, team, odds, edge, bet_time, category, created_at,
-                              consensus, implied,
-                              cons_stake, cons_payout, cons_profit,
-                              smart_stake, smart_payout, smart_profit,
-                              agg_stake, agg_payout, agg_profit,
-                              sport_key)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(),
-                    %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s,
-                    %s)
+            INSERT INTO bets (match, bookmaker, team, odds, edge, bet_time, category, sport, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
         """, (
-            bet["match"], bet["bookmaker"], bet["team"], bet["odds"], bet["edge"], bet["time"], bet["category"],
-            bet["consensus"], bet["probability"],
-            bet["cons_stake"], bet["cons_payout"], bet["cons_exp_profit"],
-            bet["smart_stake"], bet["smart_payout"], bet["smart_exp_profit"],
-            bet["agg_stake"], bet["agg_payout"], bet["agg_exp_profit"],
-            bet["sport_key"]
+            bet["match"], bet["bookmaker"], bet["team"], bet["odds"],
+            bet["edge"], bet["time_dt"], bet["category"], bet["sport"]
         ))
         conn.commit()
         cur.close()
@@ -88,7 +98,7 @@ def save_bet(bet):
         print("❌ Failed to save bet:", e)
 
 # ---------------------------
-# Odds Fetch + Bets
+# Odds Fetch
 # ---------------------------
 def fetch_odds():
     url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
@@ -106,19 +116,16 @@ def fetch_odds():
         print("❌ Odds API error:", e)
         return []
 
-SPORT_EMOJIS = {
-    "basketball": "🏀",
-    "americanfootball": "🏈",
-    "soccer": "⚽",
-    "tennis": "🎾",
-    "baseball": "⚾",
-    "icehockey": "🏒",
-    "mma": "🥊",
-    "boxing": "🥊",
-    "golf": "⛳",
-    "cricket": "🏏",
-    "default": "🎲"
-}
+# ---------------------------
+# Betting Logic
+# ---------------------------
+ALLOWED_BOOKMAKER_KEYS = [
+    "sportsbet", "bet365", "ladbrokes", "tabtouch", "neds",
+    "pointsbet", "dabble", "betfair", "tab"
+]
+
+def _allowed_bookmaker(title: str) -> bool:
+    return any(key in (title or "").lower() for key in ALLOWED_BOOKMAKER_KEYS)
 
 def calculate_bets(data):
     now = datetime.now(timezone.utc)
@@ -128,7 +135,8 @@ def calculate_bets(data):
         home, away = event.get("home_team"), event.get("away_team")
         match_name = f"{home} vs {away}"
         commence_time = event.get("commence_time")
-        sport_key = event.get("sport_key", "default")
+        sport_key = event.get("sport_key", "").lower()
+        sport_title = SPORT_EMOJIS.get(sport_key.split("_")[0], sport_key)
 
         try:
             commence_dt = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
@@ -141,62 +149,81 @@ def calculate_bets(data):
 
         consensus_by_outcome = defaultdict(list)
         for book in event.get("bookmakers", []):
+            if not _allowed_bookmaker(book.get("title", "")):
+                continue
             for market in book.get("markets", []):
                 for outcome in market.get("outcomes", []):
                     if outcome.get("price") and outcome.get("name"):
                         key = f"{market['key']}:{outcome['name']}"
-                        consensus_by_outcome[key].append(1 / outcome["price"])
+                        consensus_by_outcome[key].append(1/outcome["price"])
 
         if not consensus_by_outcome:
             continue
         global_consensus = sum(p for plist in consensus_by_outcome.values() for p in plist) / max(1, sum(len(plist) for plist in consensus_by_outcome.values()))
 
         for book in event.get("bookmakers", []):
+            title = book.get("title", "Unknown Bookmaker")
+            if not _allowed_bookmaker(title):
+                continue
             for market in book.get("markets", []):
                 for outcome in market.get("outcomes", []):
                     price, name = outcome.get("price"), outcome.get("name")
                     if not price or not name:
                         continue
-                    implied_p = 1 / price
+                    implied_p = 1/price
                     outcome_key = f"{market['key']}:{name}"
-                    consensus_p = sum(consensus_by_outcome[outcome_key]) / len(consensus_by_outcome[outcome_key]) if outcome_key in consensus_by_outcome else global_consensus
-                    edge = round((consensus_p - implied_p) * 100, 2)
+                    consensus_p = sum(consensus_by_outcome[outcome_key])/len(consensus_by_outcome[outcome_key]) if outcome_key in consensus_by_outcome else global_consensus
+                    edge = consensus_p - implied_p
                     if edge <= 0:
                         continue
 
                     cons_stake = round(BANKROLL * CONSERVATIVE_PCT, 2)
-                    smart_stake = round(cons_stake * (edge / 10), 2)
-                    agg_stake = round(cons_stake * (1 + edge / 100), 2)
+                    agg_stake = round(cons_stake * (1 + (edge*100)), 2)
+                    smart_stake = round(cons_stake * (edge*10), 2)
+
+                    cons_payout = round(cons_stake * price, 2)
+                    agg_payout = round(agg_stake * price, 2)
+                    smart_payout = round(smart_stake * price, 2)
+
+                    cons_exp_profit = round(consensus_p * cons_payout - cons_stake, 2)
+                    agg_exp_profit = round(consensus_p * agg_payout - agg_stake, 2)
+                    smart_exp_profit = round(consensus_p * smart_payout - smart_stake, 2)
 
                     bets.append({
                         "match": match_name,
-                        "bookmaker": book.get("title", "Unknown"),
+                        "bookmaker": title,
                         "team": name,
                         "odds": price,
-                        "time": commence_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                        "probability": round(implied_p * 100, 2),
-                        "consensus": round(consensus_p * 100, 2),
-                        "edge": edge,
+                        "time": commence_dt.strftime("%d/%m/%y %H:%M"),
+                        "time_dt": commence_dt,
+                        "probability": round(implied_p*100, 2),
+                        "consensus": round(consensus_p*100, 2),
+                        "edge": round(edge*100, 2),
                         "cons_stake": cons_stake,
-                        "smart_stake": smart_stake,
                         "agg_stake": agg_stake,
-                        "cons_payout": round(cons_stake * price, 2),
-                        "smart_payout": round(smart_stake * price, 2),
-                        "agg_payout": round(agg_stake * price, 2),
-                        "cons_exp_profit": round(consensus_p * cons_stake * price - cons_stake, 2),
-                        "smart_exp_profit": round(consensus_p * smart_stake * price - smart_stake, 2),
-                        "agg_exp_profit": round(consensus_p * agg_stake * price - agg_stake, 2),
+                        "smart_stake": smart_stake,
+                        "cons_payout": cons_payout,
+                        "agg_payout": agg_payout,
+                        "smart_payout": smart_payout,
+                        "cons_exp_profit": cons_exp_profit,
+                        "agg_exp_profit": agg_exp_profit,
+                        "smart_exp_profit": smart_exp_profit,
                         "quick_return": delta <= timedelta(hours=48),
                         "long_play": timedelta(hours=48) < delta <= timedelta(days=150),
-                        "category": "quick" if delta <= timedelta(hours=48) else "long",
-                        "sport_key": sport_key
+                        "sport": sport_title
                     })
     return bets
 
+# ---------------------------
+# Formatting
+# ---------------------------
 def format_bet(b, title, color):
-    emoji = SPORT_EMOJIS.get(b["sport_key"].split("_")[0], SPORT_EMOJIS["default"])
+    indicator = "🟢 Value Bet" if b['edge'] >= 2 else "🛑 Low Value"
+    sport_line = f"{b['sport']}"
+
     description = (
-        f"{emoji} **{title}**\n\n"
+        f"{indicator}\n"
+        f"{sport_line}\n\n"
         f"**Match:** {b['match']}\n"
         f"**Pick:** {b['team']} @ {b['odds']}\n"
         f"**Bookmaker:** {b['bookmaker']}\n"
@@ -204,11 +231,48 @@ def format_bet(b, title, color):
         f"**Implied %:** {b['probability']}%\n"
         f"**Edge:** {b['edge']}%\n"
         f"**Time:** {b['time']}\n\n"
-        f"💵 Conservative Stake: ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
-        f"🧠 Smart Stake: ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
-        f"🔥 Aggressive Stake: ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
+        f"💵 **Conservative Stake:** ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
+        f"🧠 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
+        f"🔥 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
     )
-    return discord.Embed(description=description, color=color)
+    return discord.Embed(title=title, description=description, color=color)
+
+def bet_id(b):
+    return f"{b['match']}|{b['team']}|{b['bookmaker']}|{b['time']}"
+
+# ---------------------------
+# Post Bets
+# ---------------------------
+async def post_bets(bets):
+    if not bets:
+        return
+
+    # ⭐ Best Bet
+    best = max(bets, key=lambda x: (x["consensus"], x["edge"]))
+    if bet_id(best) not in posted_bets:
+        posted_bets.add(bet_id(best))
+        save_bet({**best, "category": "best"})
+        channel = bot.get_channel(BEST_BETS_CHANNEL)
+        if channel:
+            await channel.send(embed=format_bet(best, "⭐ Best Bet", 0xFFD700))
+
+    # ⏱ Quick Returns
+    quick = [b for b in bets if b["quick_return"] and bet_id(b) not in posted_bets]
+    q_channel = bot.get_channel(QUICK_RETURNS_CHANNEL)
+    if q_channel:
+        for b in quick[:5]:
+            posted_bets.add(bet_id(b))
+            save_bet({**b, "category": "quick"})
+            await q_channel.send(embed=format_bet(b, "⏱ Quick Return Bet", 0x2ECC71))
+
+    # 📅 Long Plays
+    long_plays = [b for b in bets if b["long_play"] and bet_id(b) not in posted_bets]
+    l_channel = bot.get_channel(LONG_PLAYS_CHANNEL)
+    if l_channel:
+        for b in long_plays[:5]:
+            posted_bets.add(bet_id(b))
+            save_bet({**b, "category": "long"})
+            await l_channel.send(embed=format_bet(b, "📅 Longer Play Bet", 0x3498DB))
 
 # ---------------------------
 # Bot Events
@@ -216,7 +280,7 @@ def format_bet(b, title, color):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    migrate_db()  # Run DB migration automatically
+    init_db()
     if not bet_loop.is_running():
         bet_loop.start()
 
@@ -224,8 +288,10 @@ async def on_ready():
 async def bet_loop():
     data = fetch_odds()
     bets = calculate_bets(data)
-    for bet in bets:
-        save_bet(bet)
+    await post_bets(bets)
+
+if not TOKEN:
+    raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
 
