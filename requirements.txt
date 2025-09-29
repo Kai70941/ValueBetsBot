@@ -1,7 +1,0 @@
-# requirements.txt
-
-# Discord bot library (text-only, no voice/audio dependencies)
-discord.py==2.3.2
-
-# HTTP requests + async support
-aiohttp==3.9.5
