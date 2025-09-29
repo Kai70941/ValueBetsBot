@@ -1,15 +1,13 @@
 import os
 import discord
 from discord.ext import commands, tasks
-import nest_asyncio
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-# Patch Colab event loop
-nest_asyncio.apply()
-
-# Load config
+# ---------------------------
+# Config
+# ---------------------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("BEST_BETS_CHANNEL_ID", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("QUICK_RETURNS_CHANNEL_ID", "0"))
@@ -19,7 +17,9 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
 
-# Bot setup
+# ---------------------------
+# Bot Setup
+# ---------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -135,7 +135,6 @@ def calculate_bets(data):
     return bets
 
 def format_bet(b, title, color):
-    # Value indicator
     if b['edge'] >= 2:
         indicator = "🟢 Value Bet"
     else:
