@@ -13,7 +13,7 @@ LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 BANKROLL = 1000
-CONSERVATIVE_PCT = 0.015
+CONSERVATIVE_PCT = 0.015  # 1.5%
 
 # Bot setup
 intents = discord.Intents.default()
@@ -36,52 +36,20 @@ def _allowed_bookmaker(title: str) -> bool:
     return any(key in (title or "").lower() for key in ALLOWED_BOOKMAKER_KEYS)
 
 def fetch_odds():
-    base_url = "https://api.the-odds-api.com/v4"
-    all_data = []
-
-    # 1. Get short-term "upcoming" bets
+    url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "regions": "au,us,uk",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "decimal"
+    }
     try:
-        resp = requests.get(
-            f"{base_url}/sports/upcoming/odds",
-            params={
-                "apiKey": ODDS_API_KEY,
-                "regions": "au,us,uk",
-                "markets": "h2h,spreads,totals",
-                "oddsFormat": "decimal"
-            },
-            timeout=10
-        )
+        resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
-        all_data.extend(resp.json())
+        return resp.json()
     except Exception as e:
-        print("❌ Odds API upcoming error:", e)
-
-    # 2. Get long-term bets from specific sports
-    long_term_sports = [
-        "soccer_epl", 
-        "americanfootball_nfl", 
-        "basketball_nba", 
-        "tennis_atp_wimbledon"
-    ]
-
-    for sport in long_term_sports:
-        try:
-            resp = requests.get(
-                f"{base_url}/sports/{sport}/odds",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": "au,us,uk",
-                    "markets": "h2h,spreads,totals",
-                    "oddsFormat": "decimal"
-                },
-                timeout=10
-            )
-            resp.raise_for_status()
-            all_data.extend(resp.json())
-        except Exception as e:
-            print(f"⚠️ Skipping {sport}: {e}")
-
-    return all_data
+        print("❌ Odds API error:", e)
+        return []
 
 def calculate_bets(data):
     now = datetime.now(timezone.utc)
@@ -130,15 +98,9 @@ def calculate_bets(data):
                     if edge <= 0:
                         continue
 
-                    # Conservative stake (flat 1.5%)
+                    # Stakes
                     cons_stake = round(BANKROLL * CONSERVATIVE_PCT, 2)
-
-                    # Smart Stake (dynamic, capped 0.5%–3% of bankroll)
-                    kelly_fraction = (consensus_p - implied_p) / implied_p if implied_p > 0 else 0
-                    smart_pct = max(0.005, min(0.03, kelly_fraction))
-                    smart_stake = round(BANKROLL * smart_pct, 2)
-
-                    # Aggressive stake (scaled-up cons)
+                    smart_stake = round(BANKROLL * (0.005 + (edge*2/100)), 2)  # Hybrid stake: base + edge scale
                     agg_stake = round(cons_stake * (1 + (edge*100)), 2)
 
                     # Payouts
@@ -175,6 +137,7 @@ def calculate_bets(data):
     return bets
 
 def format_bet(b, title, color):
+    # Value indicator
     if b['edge'] >= 2:
         indicator = "🟢 Value Bet"
     else:
@@ -190,8 +153,8 @@ def format_bet(b, title, color):
         f"**Edge:** {b['edge']}%\n"
         f"**Time:** {b['time']}\n\n"
         f"💵 **Conservative Stake:** ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
-        f"📊 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
-        f"💰 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
+        f"🧠 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
+        f"🔥 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
     )
     return discord.Embed(title=title, description=description, color=color)
 
@@ -205,13 +168,15 @@ async def post_bets(bets):
             await channel.send("⚠️ No bets right now.")
         return
 
-    # ⭐ Best Bet
-    best = max(bets, key=lambda x: (x["consensus"], x["edge"]))
-    if bet_id(best) not in posted_bets:
-        posted_bets.add(bet_id(best))
-        channel = bot.get_channel(BEST_BETS_CHANNEL)
-        if channel:
-            await channel.send(embed=format_bet(best, "⭐ Best Bet", 0xFFD700))
+    # ⭐ Best Bet (only if edge >= 2%)
+    eligible_best = [b for b in bets if b["edge"] >= 2]
+    if eligible_best:
+        best = max(eligible_best, key=lambda x: (x["consensus"], x["edge"]))
+        if bet_id(best) not in posted_bets:
+            posted_bets.add(bet_id(best))
+            channel = bot.get_channel(BEST_BETS_CHANNEL)
+            if channel:
+                await channel.send(embed=format_bet(best, "⭐ Best Bet", 0xFFD700))
 
     # ⏱ Quick Returns
     quick = [b for b in bets if b["quick_return"] and bet_id(b) not in posted_bets]
