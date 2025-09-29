@@ -7,58 +7,58 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
-# ---------------------------
-# Load Config
-# ---------------------------
+# Load config
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway public URL here
+DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL")
 
 BANKROLL = 1000
 CONSERVATIVE_PCT = 0.015
 
-# ---------------------------
-# Database Setup
-# ---------------------------
-def get_db_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
-
-def init_db():
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bets (
-            id SERIAL PRIMARY KEY,
-            match TEXT,
-            bookmaker TEXT,
-            team TEXT,
-            odds FLOAT,
-            edge FLOAT,
-            bet_time TIMESTAMP,
-            category TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-init_db()
-
-# ---------------------------
-# Bot Setup
-# ---------------------------
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Track posted bets to avoid duplicates
 posted_bets = set()
+
+# ---------------------------
+# Database Helpers
+# ---------------------------
+
+def save_bet_to_db(bet, category):
+    try:
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=RealDictCursor)
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO bets (match, bookmaker, team, odds, edge, bet_time, category, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            bet['match'],
+            bet['bookmaker'],
+            bet['team'],
+            bet['odds'],
+            bet['edge'],
+            bet['time'],
+            category,
+            datetime.utcnow()
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("❌ Failed to save bet:", e)
 
 # ---------------------------
 # Betting Logic
 # ---------------------------
+
 ALLOWED_BOOKMAKER_KEYS = [
     "sportsbet", "bet365", "ladbrokes", "tabtouch", "neds",
     "pointsbet", "dabble", "betfair", "tab"
@@ -133,7 +133,7 @@ def calculate_bets(data):
                     # Stakes
                     cons_stake = round(BANKROLL * CONSERVATIVE_PCT, 2)
                     agg_stake = round(cons_stake * (1 + (edge*100)), 2)
-                    smart_stake = round((BANKROLL * 0.005) + (edge * 50), 2)
+                    smart_stake = round((BANKROLL * 0.005) + (BANKROLL * (edge/2)), 2)
 
                     # Payouts
                     cons_payout = round(cons_stake * price, 2)
@@ -184,8 +184,8 @@ def format_bet(b, title, color):
         f"**Edge:** {b['edge']}%\n"
         f"**Time:** {b['time']}\n\n"
         f"💵 **Conservative Stake:** ${b['cons_stake']} → Payout: ${b['cons_payout']} | Exp. Profit: ${b['cons_exp_profit']}\n"
+        f"💰 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
         f"🧠 **Smart Stake:** ${b['smart_stake']} → Payout: ${b['smart_payout']} | Exp. Profit: ${b['smart_exp_profit']}\n"
-        f"🔥 **Aggressive Stake:** ${b['agg_stake']} → Payout: ${b['agg_payout']} | Exp. Profit: ${b['agg_exp_profit']}\n"
     )
     return discord.Embed(title=title, description=description, color=color)
 
@@ -206,6 +206,7 @@ async def post_bets(bets):
         channel = bot.get_channel(BEST_BETS_CHANNEL)
         if channel:
             await channel.send(embed=format_bet(best, "⭐ Best Bet", 0xFFD700))
+            save_bet_to_db(best, "best")
 
     # ⏱ Quick Returns
     quick = [b for b in bets if b["quick_return"] and bet_id(b) not in posted_bets]
@@ -214,6 +215,7 @@ async def post_bets(bets):
         for b in quick[:5]:
             posted_bets.add(bet_id(b))
             await q_channel.send(embed=format_bet(b, "⏱ Quick Return Bet", 0x2ECC71))
+            save_bet_to_db(b, "quick")
 
     # 📅 Long Plays
     long_plays = [b for b in bets if b["long_play"] and bet_id(b) not in posted_bets]
@@ -222,10 +224,12 @@ async def post_bets(bets):
         for b in long_plays[:5]:
             posted_bets.add(bet_id(b))
             await l_channel.send(embed=format_bet(b, "📅 Longer Play Bet", 0x3498DB))
+            save_bet_to_db(b, "long")
 
 # ---------------------------
 # Bot Events
 # ---------------------------
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
@@ -252,6 +256,7 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
+
 
 
 
