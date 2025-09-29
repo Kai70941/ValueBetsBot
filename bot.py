@@ -14,6 +14,7 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
 LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
+VALUE_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "1422337929392689233"))  # NEW
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -87,11 +88,9 @@ def format_sport(event):
     sport_key = event.get("sport_key", "").lower()
     sport_title = event.get("sport_title", "Unknown Sport")
 
-    # main sport (before underscore)
     main_key = sport_key.split("_")[0]
     emoji = SPORT_EMOJIS.get(main_key, "🎲")
 
-    # league (after underscore)
     league = None
     if "_" in sport_key:
         league = sport_key.split("_", 1)[1].replace("_", " ").title()
@@ -218,10 +217,7 @@ def calculate_bets(data):
 # Format Bets
 # ---------------------------
 def format_bet(b, title, color):
-    if b['edge'] >= 2:
-        indicator = "🟢 Value Bet"
-    else:
-        indicator = "🛑 Low Value"
+    indicator = "🟢 Value Bet" if b['edge'] >= 2 else "🛑 Low Value"
 
     description = (
         f"{indicator}\n\n"
@@ -249,6 +245,7 @@ async def post_bets(bets):
     if not bets:
         return
 
+    # ⭐ Best Bet
     best = max(bets, key=lambda x: (x["consensus"], x["edge"]))
     if bet_id(best) not in posted_bets:
         posted_bets.add(bet_id(best))
@@ -256,6 +253,7 @@ async def post_bets(bets):
         if channel:
             await channel.send(embed=format_bet(best, "⭐ Best Bet", 0xFFD700))
 
+    # ⏱ Quick Returns
     quick = [b for b in bets if b["quick_return"] and bet_id(b) not in posted_bets]
     q_channel = bot.get_channel(QUICK_RETURNS_CHANNEL)
     if q_channel:
@@ -263,12 +261,21 @@ async def post_bets(bets):
             posted_bets.add(bet_id(b))
             await q_channel.send(embed=format_bet(b, "⏱ Quick Return Bet", 0x2ECC71))
 
+    # 📅 Long Plays
     long_plays = [b for b in bets if b["long_play"] and bet_id(b) not in posted_bets]
     l_channel = bot.get_channel(LONG_PLAYS_CHANNEL)
     if l_channel:
         for b in long_plays[:5]:
             posted_bets.add(bet_id(b))
             await l_channel.send(embed=format_bet(b, "📅 Longer Play Bet", 0x3498DB))
+
+    # 🟢 Value Bets (extra channel for testing)
+    v_channel = bot.get_channel(VALUE_BETS_CHANNEL)
+    if v_channel:
+        for b in bets:
+            if b["edge"] >= 2 and bet_id(b) not in posted_bets:
+                posted_bets.add(bet_id(b))
+                await v_channel.send(embed=format_bet(b, "🟢 Value Bet (Testing)", 0x1ABC9C))
 
 # ---------------------------
 # Bot Events
@@ -281,10 +288,6 @@ async def on_ready():
         print("✅ Slash commands synced.")
     except Exception as e:
         print(f"❌ Slash sync failed: {e}")
-
-    channel = bot.get_channel(BEST_BETS_CHANNEL)
-    if channel:
-        await channel.send("🎲 Betting bot is online and rolling bets!")
 
     if not bet_loop.is_running():
         bet_loop.start()
@@ -299,6 +302,7 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
+
 
 
 
