@@ -56,6 +56,48 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # In-memory dedupe for this runtime
 posted_keys = set()
 
+# Small, fast in-memory cache so buttons can work even if DB is a bit behind
+# bet_key -> (bet_dict, cached_at)
+BET_CACHE: dict[str, tuple[dict, float]] = {}
+BET_CACHE_TTL_SEC = 15 * 60  # keep 15 minutes
+BET_CACHE_MAX = 2000         # cap to avoid unbounded growth
+
+def _prune_cache_now():
+    # quick pruning to keep cache healthy
+    now = asyncio.get_event_loop().time() if asyncio.get_running_loop().is_running() else 0.0
+    if len(BET_CACHE) > BET_CACHE_MAX:
+        # Drop oldest half
+        items = sorted(BET_CACHE.items(), key=lambda kv: kv[1][1])
+        for k, _ in items[: len(items)//2 ]:
+            BET_CACHE.pop(k, None)
+    # also drop expired
+    if now:
+        for k, (_, ts) in list(BET_CACHE.items()):
+            if now - ts > BET_CACHE_TTL_SEC:
+                BET_CACHE.pop(k, None)
+
+def _add_to_cache(bet: dict):
+    try:
+        ts = asyncio.get_event_loop().time()
+    except RuntimeError:
+        ts = 0.0
+    BET_CACHE[bet["bet_key"]] = (bet, ts)
+    _prune_cache_now()
+
+def _get_from_cache(bet_key: str):
+    tup = BET_CACHE.get(bet_key)
+    if not tup:
+        return None
+    bet, ts = tup
+    try:
+        now = asyncio.get_event_loop().time()
+        if now - ts > BET_CACHE_TTL_SEC:
+            BET_CACHE.pop(bet_key, None)
+            return None
+    except RuntimeError:
+        pass
+    return bet
+
 # ----------------------------
 # DB URL auto-detect (no renaming needed)
 # ----------------------------
@@ -134,7 +176,7 @@ def _migrate():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS settings (
         id BOOLEAN PRIMARY KEY DEFAULT TRUE,
-        mode TEXT DEFAULT 'live',  -- 'live' or 'test'
+        mode TEXT DEFAULT 'live',
         updated_at TIMESTAMPTZ DEFAULT NOW()
     );
     """)
@@ -144,6 +186,7 @@ def _migrate():
     """)
     # indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_bet_key ON bets(bet_key);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_time ON bets(bet_time);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_bet_key ON user_bets(bet_key);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_user ON user_bets(user_id);")
     conn.commit()
@@ -151,37 +194,8 @@ def _migrate():
     conn.close()
     log.info("DB migration complete (using %s -> %s)", DB_VAR_NAME or "NONE", _mask(DATABASE_URL) if DB_OK else "N/A")
 
-def get_mode() -> str:
-    if not DB_OK:
-        return "live"
-    try:
-        conn = _connect()
-        cur = conn.cursor()
-        cur.execute("SELECT mode FROM settings WHERE id=TRUE;")
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return (row["mode"] if row and row.get("mode") else "live")
-    except Exception:
-        log.exception("get_mode failed")
-        return "live"
-
-def set_mode(new_mode: str) -> bool:
-    if not DB_OK:
-        return False
-    try:
-        conn = _connect()
-        cur = conn.cursor()
-        cur.execute("UPDATE settings SET mode=%s, updated_at=NOW() WHERE id=TRUE;", (new_mode,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception:
-        log.exception("set_mode failed")
-        return False
-
-def save_bet_row(bet: dict):
+# ---------- sync DB funcs (run in thread) ----------
+def _save_bet_row_sync(bet: dict) -> bool:
     if not DB_OK:
         return False
     try:
@@ -209,37 +223,12 @@ def save_bet_row(bet: dict):
         conn.commit()
         cur.close()
         conn.close()
-        logging.info("Saved bet: %s", bet.get("bet_key"))
         return True
     except Exception:
         log.exception("Failed to save bet row")
         return False
 
-def save_user_bet(user: discord.User | discord.Member, bet: dict, strategy: str, units: float, odds: float, exp_profit: float):
-    if not DB_OK:
-        return False
-    try:
-        conn = _connect()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO user_bets
-               (user_id, username, bet_key, event_id, sport, league, strategy, units, odds, exp_profit)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
-        """, (
-            str(user.id), str(user),
-            bet.get("bet_key"), bet.get("event_id") or None,
-            bet.get("sport"), bet.get("league"),
-            strategy, float(units or 0), float(odds or 0), float(exp_profit or 0)
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception:
-        log.exception("Failed to save user bet")
-        return False
-
-def fetch_bet_row(bet_key: str):
+def _fetch_bet_row_sync(bet_key: str):
     if not DB_OK:
         return None
     try:
@@ -253,6 +242,40 @@ def fetch_bet_row(bet_key: str):
     except Exception:
         log.exception("fetch_bet_row failed")
         return None
+
+def _save_user_bet_sync(user_id: str, username: str, bet: dict, strategy: str, units: float, odds: float, exp_profit: float) -> bool:
+    if not DB_OK:
+        return False
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO user_bets
+               (user_id, username, bet_key, event_id, sport, league, strategy, units, odds, exp_profit)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+        """, (
+            user_id, username,
+            bet.get("bet_key"), bet.get("event_id") or None,
+            bet.get("sport"), bet.get("league"),
+            strategy, float(units or 0), float(odds or 0), float(exp_profit or 0)
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception:
+        log.exception("Failed to save user bet")
+        return False
+
+# ---------- async wrappers ----------
+async def asave_bet_row(bet: dict) -> bool:
+    return await asyncio.to_thread(_save_bet_row_sync, bet)
+
+async def afetch_bet_row(bet_key: str):
+    return await asyncio.to_thread(_fetch_bet_row_sync, bet_key)
+
+async def asave_user_bet(user: discord.abc.User, bet: dict, strategy: str, units: float, odds: float, exp_profit: float) -> bool:
+    return await asyncio.to_thread(_save_user_bet_sync, str(user.id), str(user), bet, strategy, units, odds, exp_profit)
 
 # ----------------------------
 # Sports emojis + league naming
@@ -354,7 +377,7 @@ def calculate_bets(raw):
         for book in ev.get("bookmakers", []):
             if not _allowed_bookmaker(book.get("title", "")):
                 continue
-            for m in book in book.get("markets", []):
+            for m in book.get("markets", []):
                 mkey = m.get("key")
                 for out in m.get("outcomes", []):
                     price = out.get("price")
@@ -422,7 +445,7 @@ def calculate_bets(raw):
                         "consensus": round(cons, 2),
                         "implied": round(implied, 2),
 
-                        "cons_units": round(cons_units, 2),
+                        "cons_units": round(CONSERVATIVE_UNITS, 2),
                         "smart_units": round(smart_units, 2),
                         "aggr_units": round(aggr_units, 2),
                         "cons_exp": cons_exp,
@@ -476,11 +499,34 @@ def embed_for_bet(title: str, bet: dict, color: int):
     return emb
 
 # ----------------------------
-# Posting logic (respects mode + role alert)
+# Mode helpers
+# ----------------------------
+def get_mode() -> str:
+    if not DB_OK:
+        return "live"
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT mode FROM settings WHERE id=TRUE;")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return (row["mode"] if row and row.get("mode") else "live")
+    except Exception:
+        log.exception("get_mode failed")
+        return "live"
+
+# ----------------------------
+# Posting logic (write-before-post + cache)
 # ----------------------------
 async def post_bet_to_channels(bet: dict):
-    # Save first (so buttons can fetch from DB even after restart)
-    save_bet_row(bet)
+    # 1) Put into cache immediately (so buttons can work right away)
+    _add_to_cache(bet)
+
+    # 2) Persist in background thread and (best-effort) wait briefly for it to land
+    ok = await asave_bet_row(bet)
+    if not ok:
+        log.warning("DB save failed for %s; button will fall back to cache", bet["bet_key"])
 
     # Determine mode
     mode = get_mode()  # 'live' or 'test'
@@ -497,7 +543,6 @@ async def post_bet_to_channels(bet: dict):
     # Post destination(s)
     targets = []
     if bet.get("_is_best"):
-        # Best bet goes to best channel; in test mode, also mirror to value test channel only if CH_VALUE set
         if mode == "live" and CH_BEST:
             targets.append(CH_BEST)
         elif mode == "test" and CH_VALUE:
@@ -518,7 +563,6 @@ async def post_bet_to_channels(bet: dict):
         channel = bot.get_channel(ch_id)
         if channel:
             try:
-                # Role ping for Best Bet if configured and in live mode
                 if bet.get("_is_best") and ALERT_ROLE_ID and mode == "live":
                     role_mention = f"<@&{ALERT_ROLE_ID}>"
                     await channel.send(content=role_mention)
@@ -558,7 +602,7 @@ async def post_pack(bets: list[dict]):
         await post_bet_to_channels(b)
 
 # ----------------------------
-# Button handler (survives restarts)
+# Button handler (DB -> cache fallback)
 # ----------------------------
 @bot.listen("on_interaction")
 async def handle_place_buttons(inter: discord.Interaction):
@@ -578,12 +622,34 @@ async def handle_place_buttons(inter: discord.Interaction):
             await inter.followup.send("Invalid button payload.", ephemeral=True)
             return
 
-        row = fetch_bet_row(bet_key)
+        # Try DB first
+        row = await afetch_bet_row(bet_key)
+
+        # Fallback to cache if DB hasn't caught up yet
         if not row:
-            await inter.followup.send("Sorry, I couldn't find this bet in the database.", ephemeral=True)
+            cached = _get_from_cache(bet_key)
+            if cached:
+                # Try to persist it quickly, then proceed
+                await asave_bet_row(cached)
+                row = await afetch_bet_row(bet_key)
+            if not row and cached:
+                # Still not there; use cached fields directly
+                row = {
+                    "bet_key": cached["bet_key"],
+                    "match": cached["match"],
+                    "team": cached["team"],
+                    "edge": cached["edge"],
+                    "odds": cached["odds"],
+                    "consensus": cached["consensus"],
+                    "sport": cached["sport"],
+                    "league": cached["league"],
+                }
+
+        if not row:
+            await inter.followup.send("Sorry, I couldn't find this bet yet. Please try again in a few seconds.", ephemeral=True)
             return
 
-        # Recompute stakes using stored edge/odds and expected profit using stored consensus
+        # Recompute stakes using stored/cached edge/odds and expected profit using stored consensus
         edge = float(row.get("edge") or 0.0)
         odds = float(row.get("odds") or 0.0)
         consensus = float(row.get("consensus") or 50.0)
@@ -606,16 +672,14 @@ async def handle_place_buttons(inter: discord.Interaction):
             "league": row.get("league"),
         }
 
-        ok = save_user_bet(inter.user, bet_payload, strategy, units, odds, ep)
+        ok = await asave_user_bet(inter.user, bet_payload, strategy, units, odds, ep)
         if ok:
-            # Ephemeral confirm
             await inter.followup.send(
                 f"Saved **{strategy.capitalize()}** bet for **{row['match']}** — {row['team']} | {units:.2f} units",
                 ephemeral=True
             )
-            # Light DM (optional, ignore errors)
             try:
-                await inter.user.send(f"✅ Saved your {strategy} bet: {row['match']} — {row['team']} ({units:.2f} units at {odds})")
+                await inter.user.send(f"✅ Saved your {strategy} bet: {row['match']} — {row['team']} ({units:.2f}u @ {odds})")
             except Exception:
                 pass
         else:
@@ -634,7 +698,7 @@ async def bet_loop():
     await post_pack(bets)
 
 # ----------------------------
-# Slash commands
+# Slash commands (unchanged features)
 # ----------------------------
 @bot.tree.command(name="ping", description="Ping the bot")
 async def ping(ctx: discord.Interaction):
@@ -691,7 +755,6 @@ async def dblatest(ctx: discord.Interaction):
         log.exception("dblatest failed")
         await ctx.response.send_message("dblatest failed.", ephemeral=True)
 
-# (#3) Stats with Top Performing League
 @bot.tree.command(name="stats", description="Paper-trade stats (bets, win rate, expected P&L, ROI) + best league")
 async def stats(ctx: discord.Interaction):
     if not DB_OK:
@@ -719,7 +782,7 @@ async def stats(ctx: discord.Interaction):
             SELECT
               COUNT(*) AS n,
               COALESCE(SUM(ub.units), 0) AS units,
-              COALESCE(SUM(ub.exp_profit), 0) AS exp_p,
+              COALESCE(SUM(ub.exp_profit), 0) AS ep,
               AVG(b.consensus) AS avg_consensus
             FROM user_bets ub
             LEFT JOIN bets b ON b.bet_key = ub.bet_key;
@@ -758,7 +821,7 @@ async def stats(ctx: discord.Interaction):
 
         n  = int(total["n"] or 0)
         u  = float(total["units"] or 0)
-        ep = float(total["exp_p"] or 0)
+        ep = float(total["ep"] or 0)
         wr = float(total["avg_consensus"] or 0.0)
         roi = (ep / u * 100.0) if u > 0 else 0.0
         lines.append(f"\n**Total** → **{n} bets** | **{u:.2f} units** | **Win rate {wr:.2f}%** | **P&L {ep:.2f}** | **ROI {roi:.2f}%**")
@@ -772,7 +835,6 @@ async def stats(ctx: discord.Interaction):
         log.exception("/stats failed")
         await ctx.response.send_message("Stats failed.", ephemeral=True)
 
-# (#6) My bets (personal history)
 @bot.tree.command(name="mybets", description="Show your recent bets (optionally filter by strategy) and mini-stats")
 async def mybets(ctx: discord.Interaction, strategy: str | None = None, limit: int = 10):
     if not DB_OK:
@@ -845,29 +907,6 @@ async def dbsource(ctx: discord.Interaction):
         f"Using **{DB_VAR_NAME}**\n`{_mask(DATABASE_URL)}`",
         ephemeral=True
     )
-
-# (#8) Mode controls
-@bot.tree.command(name="setmode", description="Set bot mode: live or test (admin only)")
-@discord.app_commands.describe(mode="live or test")
-async def setmode_cmd(ctx: discord.Interaction, mode: str):
-    # Admin check: require Manage Guild
-    perms = ctx.user.guild_permissions if hasattr(ctx.user, "guild_permissions") else None
-    if not perms or not perms.manage_guild:
-        await ctx.response.send_message("You need **Manage Server** permission to change mode.", ephemeral=True)
-        return
-    mode = mode.lower().strip()
-    if mode not in ("live", "test"):
-        await ctx.response.send_message("Mode must be `live` or `test`.", ephemeral=True)
-        return
-    ok = set_mode(mode)
-    if ok:
-        await ctx.response.send_message(f"✅ Mode set to **{mode}**.", ephemeral=True)
-    else:
-        await ctx.response.send_message("❌ Failed to set mode.", ephemeral=True)
-
-@bot.tree.command(name="getmode", description="Show current bot mode")
-async def getmode_cmd(ctx: discord.Interaction):
-    await ctx.response.send_message(f"Current mode: **{get_mode()}**", ephemeral=True)
 
 # ----------------------------
 # Events
