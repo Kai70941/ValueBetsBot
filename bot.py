@@ -11,7 +11,14 @@ from discord.ext import commands, tasks
 from discord import app_commands, Interaction, Embed, Colour
 
 import aiohttp
-import asyncpg
+
+# Try to import asyncpg, but don't crash if it's missing.
+try:
+    import asyncpg  # type: ignore
+    ASYNCPG_AVAILABLE = True
+except Exception:
+    asyncpg = None
+    ASYNCPG_AVAILABLE = False
 
 # ------------- CONFIG -------------
 
@@ -33,35 +40,29 @@ ALLOWED_BOOKMAKER_KEYS = [
     "pointsbet", "dabble", "betfair", "tab"
 ]
 
-# Value determination
 EDGE_VALUE_THRESHOLD = 2.0  # % edge to label as "Value"
 
-# Async HTTP controls
+# HTTP
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=10)
 SESSION: Optional[aiohttp.ClientSession] = None
-
-# Prevent overlapping fetches (loop vs /fetchbets)
 FETCH_LOCK = asyncio.Lock()
 
 # Track posted bets to avoid duplicate spam
 posted_bets = set()
 
-# ------------- DISCORD SETUP -------------
-
+# Discord setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ------------- LOGGING -------------
-
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("valuebets")
 
-# ------------- SPORT/LEAGUE HELPERS -------------
-
+# SPORT helpers
 SPORT_EMOJI = {
     "soccer": "⚽",
     "americanfootball": "🏈",
@@ -81,10 +82,8 @@ SPORT_EMOJI = {
 }
 
 def canonical_sport_key(sport_key: str) -> str:
-    # Ensure soccer shows as Soccer (not "Football")
     if "soccer" in sport_key.lower():
         return "soccer"
-    # condense other sport keys to base token
     return re.sub(r"[^a-z]", "", sport_key.lower())
 
 def sport_title_from_key(key: str) -> str:
@@ -108,19 +107,10 @@ def sport_title_from_key(key: str) -> str:
     return m.get(key, key.capitalize())
 
 def extract_league(sport_title: str, event_title: str) -> str:
-    """
-    Try to extract a league-like label. The Odds API often uses titles like:
-    'Soccer - Brazil Serie B' or 'American Football - NCAA'
-    We'll try sport_title first, then fall back to event title context.
-    """
-    # common form: '<Sport> - <League>'
     if " - " in sport_title:
         parts = sport_title.split(" - ", 1)
         if len(parts) == 2 and parts[1].strip():
             return parts[1].strip()
-
-    # Sometimes event title embeds league info; try to capture division like 'Serie B', 'La Liga', etc.
-    # Very heuristic; improves a lot of cases without being perfect.
     patterns = [
         r"(Serie [ABCD])",
         r"(La Liga|Premier League|Bundesliga|Ligue 1|Eredivisie)",
@@ -132,26 +122,19 @@ def extract_league(sport_title: str, event_title: str) -> str:
         m = re.search(pat, event_title, re.IGNORECASE)
         if m:
             return m.group(1).title()
-
-    # fallback
     return "Unknown League"
 
 def sport_and_league(event: dict) -> Tuple[str, str, str]:
-    """
-    Returns (emoji, sport_title, league)
-    """
     skey_raw = event.get("sport_key", "") or ""
     stitle_raw = event.get("sport_title", "") or ""
     title = event.get("title", "") or ""
-
     key = canonical_sport_key(skey_raw)
     emoji = SPORT_EMOJI.get(key, "🎲")
     sport_name = sport_title_from_key(key)
-    league = extract_league(stitle_raw or sport_name, title)  # pass both for heuristics
+    league = extract_league(stitle_raw or sport_name, title)
     return emoji, sport_name, league
 
-# ------------- HTTP / ODDS API -------------
-
+# HTTP client
 async def get_http_session() -> aiohttp.ClientSession:
     global SESSION
     if SESSION is None or SESSION.closed:
@@ -159,10 +142,6 @@ async def get_http_session() -> aiohttp.ClientSession:
     return SESSION
 
 async def fetch_odds() -> List[dict]:
-    """
-    Async, robust odds fetcher with timeouts & error handling.
-    Returns [] on error so callers can still reply to the user.
-    """
     url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -184,9 +163,8 @@ async def fetch_odds() -> List[dict]:
         log.exception(f"Odds API error: {e}")
     return []
 
-# ------------- DB LAYER -------------
-
-pool: Optional[asyncpg.Pool] = None
+# --------- DB (optional) ----------
+pool = None
 
 CREATE_BETS_TABLE = """
 CREATE TABLE IF NOT EXISTS bets (
@@ -215,8 +193,8 @@ CREATE TABLE IF NOT EXISTS bets (
 
 async def init_db():
     global pool
-    if not DATABASE_URL:
-        log.warning("DATABASE_URL is not set; DB features disabled.")
+    if not ASYNCPG_AVAILABLE or not DATABASE_URL:
+        log.warning("DB disabled (asyncpg missing or DATABASE_URL unset).")
         return
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
     async with pool.acquire() as con:
@@ -224,7 +202,7 @@ async def init_db():
     log.info("DB ready.")
 
 async def save_bet_row(row: dict):
-    if not pool:
+    if not ASYNCPG_AVAILABLE or not pool:
         return
     q = """
         INSERT INTO bets (event_id, match, bookmaker, team, odds, consensus, implied, edge,
@@ -257,7 +235,7 @@ async def save_bet_row(row: dict):
             row.get("league"),
         )
 
-# ------------- BET LOGIC -------------
+# ---------- BET LOGIC ----------
 
 def _allowed_bookmaker(title: str) -> bool:
     t = (title or "").lower()
@@ -281,7 +259,6 @@ def calculate_bets(data: List[dict]) -> List[dict]:
         if delta.total_seconds() <= 0 or delta > timedelta(days=150):
             continue
 
-        # consensus implied probabilities by outcome
         consensus_by_outcome = {}
         counts_by_outcome = {}
 
@@ -319,15 +296,12 @@ def calculate_bets(data: List[dict]) -> List[dict]:
 
                     consensus_p = consensus_by_outcome[out_key] / max(1, counts_by_outcome[out_key])
                     implied_p = 1.0 / float(price)
-                    edge = (consensus_p - implied_p) * 100.0  # in %
+                    edge = (consensus_p - implied_p) * 100.0  # %
 
-                    # stakes in units
                     cons_stake = round(BANKROLL_UNITS * CONSERVATIVE_PCT, 2)
-                    # simple Kelly-ish bump by edge (constrained)
                     smart_stake = round(min(cons_stake * (1 + max(0.0, edge) / 50.0), cons_stake * 5), 2)
                     agg_stake = round(min(cons_stake * (1 + max(0.0, edge) / 20.0), cons_stake * 15), 2)
 
-                    # expected profit approximations (prob * payout - stake)
                     cons_payout = round(cons_stake * float(price), 2)
                     smart_payout = round(smart_stake * float(price), 2)
                     agg_payout = round(agg_stake * float(price), 2)
@@ -373,10 +347,6 @@ def value_indicator(b: dict) -> Tuple[str, Colour]:
     return "🔴 Low Value", Colour.from_str("#e74c3c")
 
 def best_bet_selection(bets: List[dict]) -> Optional[dict]:
-    """
-    Choose a best bet that is NOT low-value.
-    Score = consensus_prob * (odds - 1) to balance chance & payout.
-    """
     candidates = [b for b in bets if b["edge"] >= EDGE_VALUE_THRESHOLD]
     if not candidates:
         return None
@@ -394,8 +364,6 @@ def format_bet_embed(b: dict, title: str) -> Embed:
     em.add_field(name="Implied %", value=f"{b['implied']}%", inline=True)
     em.add_field(name="Edge", value=f"{b['edge']}%", inline=True)
     em.add_field(name="Time", value=b["bet_time"].strftime("%d/%m/%y %H:%M"), inline=False)
-
-    # Unit-based stakes
     em.add_field(
         name="💵 Conservative Stake",
         value=f"{b['cons_stake']}u → Payout: {(b['cons_stake']*b['odds']):.2f}u | Exp. Profit: {b['cons_exp_profit']:.2f}u",
@@ -411,8 +379,6 @@ def format_bet_embed(b: dict, title: str) -> Embed:
         value=f"{b['agg_stake']}u → Payout: {(b['agg_stake']*b['odds']):.2f}u | Exp. Profit: {b['agg_exp_profit']:.2f}u",
         inline=False
     )
-
-    # small label
     em.description = label
     return em
 
@@ -423,17 +389,14 @@ async def post_bets(bets: List[dict]):
             await ch.send("⚠️ No bets this cycle.")
         return
 
-    # Best Bet
     best = best_bet_selection(bets)
     if best and bet_id(best) not in posted_bets:
         posted_bets.add(bet_id(best))
         ch = bot.get_channel(BEST_BETS_CHANNEL)
         if ch:
             await ch.send(embed=format_bet_embed(best, "⭐ Best Bet"))
-        # Save to DB
         await save_bet_row({**best, "category": "best"})
 
-    # Quick Returns
     qch = bot.get_channel(QUICK_RETURNS_CHANNEL)
     for b in [x for x in bets if x["quick_return"]]:
         if bet_id(b) in posted_bets:
@@ -443,7 +406,6 @@ async def post_bets(bets: List[dict]):
             await qch.send(embed=format_bet_embed(b, "⏱ Quick Return Bet"))
         await save_bet_row({**b, "category": "quick"})
 
-    # Long Plays
     lch = bot.get_channel(LONG_PLAYS_CHANNEL)
     for b in [x for x in bets if x["long_play"]]:
         if bet_id(b) in posted_bets:
@@ -453,23 +415,15 @@ async def post_bets(bets: List[dict]):
             await lch.send(embed=format_bet_embed(b, "📅 Longer Play Bet"))
         await save_bet_row({**b, "category": "long"})
 
-    # DUPLICATE value bets to VALUE_BETS_CHANNEL
     vch = bot.get_channel(VALUE_BETS_CHANNEL)
     if vch:
         for b in bets:
             if b["edge"] >= EDGE_VALUE_THRESHOLD and bet_id(b) in posted_bets:
-                # already posted to one of the channels above; just duplicate for value feed
                 await vch.send(embed=format_bet_embed(b, "✅ Value Bet"))
 
-# ------------- ROI -------------
-
+# ROI
 async def compute_roi(strategy: Optional[str] = None) -> Tuple[float, int]:
-    """
-    Computes expected ROI from posted bets in DB:
-    ROI = (sum expected profits) / (sum stakes) * 100
-    Optional strategy filter: best/quick/long
-    """
-    if not pool:
+    if not ASYNCPG_AVAILABLE or not pool:
         return 0.0, 0
     base = "SELECT cons_exp_profit+smart_exp_profit+agg_exp_profit AS exp_profit," \
            " cons_stake_units+smart_stake_units+agg_stake_units AS stake FROM bets"
@@ -478,24 +432,16 @@ async def compute_roi(strategy: Optional[str] = None) -> Tuple[float, int]:
     if strategy and strategy.lower() in {"best", "quick", "long"}:
         cond = " WHERE category = $1"
         params.append(strategy.lower())
-
-    rows = []
     async with pool.acquire() as con:
         rows = await con.fetch(base + cond, *params)
-
-    total_profit = 0.0
-    total_stake = 0.0
-    for r in rows:
-        total_profit += float(r["exp_profit"] or 0)
-        total_stake += float(r["stake"] or 0)
-
+    total_profit = sum(float(r["exp_profit"] or 0) for r in rows)
+    total_stake = sum(float(r["stake"] or 0) for r in rows)
     if total_stake <= 0:
         return 0.0, len(rows)
     roi = (total_profit / total_stake) * 100.0
     return roi, len(rows)
 
-# ------------- COMMANDS -------------
-
+# Commands
 @app_commands.command(name="ping", description="Latency check")
 async def ping(interaction: Interaction):
     await interaction.response.send_message("🏓 Pong!", ephemeral=True)
@@ -504,6 +450,9 @@ async def ping(interaction: Interaction):
 @app_commands.describe(strategy="Optional: best, quick, or long")
 async def roi(interaction: Interaction, strategy: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
+    if not ASYNCPG_AVAILABLE or not pool:
+        await interaction.followup.send("📦 Database not configured; ROI unavailable.", ephemeral=True)
+        return
     try:
         roi_value, n = await compute_roi(strategy)
         sfx = f" for **{strategy}**" if strategy else ""
@@ -518,21 +467,18 @@ async def roi(interaction: Interaction, strategy: Optional[str] = None):
 @app_commands.command(name="fetchbets", description="Force pull & post qualifying bets.")
 async def fetchbets(interaction: Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
-
     if FETCH_LOCK.locked():
-        await interaction.followup.send("Another fetch is already running—try again shortly.", ephemeral=True)
+        await interaction.followup.send("Another fetch is running—try again shortly.", ephemeral=True)
         return
-
     async with FETCH_LOCK:
         try:
             data = await asyncio.wait_for(fetch_odds(), timeout=25)
         except asyncio.TimeoutError:
-            await interaction.followup.send("The Odds API timed out. Please try again.", ephemeral=True)
+            await interaction.followup.send("Odds API timed out. Try again.", ephemeral=True)
             return
         except Exception as e:
             await interaction.followup.send(f"Fetch failed: {e}", ephemeral=True)
             return
-
         bets = calculate_bets(data)
         try:
             await post_bets(bets)
@@ -540,11 +486,9 @@ async def fetchbets(interaction: Interaction):
             log.exception("post_bets failed")
             await interaction.followup.send(f"Fetched {len(bets)} bets but posting failed: {e}", ephemeral=True)
             return
-
         await interaction.followup.send(f"Fetched {len(bets)} bets and posted qualifying ones.", ephemeral=True)
 
-# ------------- LOOP -------------
-
+# Loop
 @tasks.loop(minutes=10)
 async def bet_loop():
     if FETCH_LOCK.locked():
@@ -561,25 +505,19 @@ async def bet_loop():
         except Exception:
             log.exception("Loop post_bets failed")
 
-# ------------- EVENTS -------------
-
+# Events
 @bot.event
 async def on_ready():
     log.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # DB
     try:
         await init_db()
     except Exception:
         log.exception("DB init failed")
-
-    # sync slash commands
     try:
         await bot.tree.sync()
         log.info("Slash commands synced.")
     except Exception:
         log.exception("Slash sync failed")
-
-    # kick off loop
     if not bet_loop.is_running():
         bet_loop.start()
 
@@ -589,13 +527,9 @@ async def on_close():
     if SESSION and not SESSION.closed:
         await SESSION.close()
 
-# ------------- RUN -------------
-
 if not TOKEN:
     raise SystemExit("❌ DISCORD_BOT_TOKEN is missing.")
 bot.run(TOKEN)
-
-
 
 
 
