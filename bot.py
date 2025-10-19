@@ -26,7 +26,10 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 CH_BEST  = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0") or "0")
 CH_QUICK = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0") or "0")
 CH_LONG  = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0") or "0")
-CH_VALUE = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0") or "0")  # duplicate stream for value bets
+CH_VALUE = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0") or "0")  # duplicate stream for value bets (testing)
+
+# Optional: role ping for Best Bet alerts
+ALERT_ROLE_ID = int(os.getenv("ALERT_ROLE_ID", "0") or "0")
 
 # Units config
 CONSERVATIVE_UNITS = float(os.getenv("CONSERVATIVE_UNITS", "15.0"))
@@ -127,7 +130,19 @@ def _migrate():
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
     """)
-    # non-destructive adds / indexes
+    # settings table (for mode etc.)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        id BOOLEAN PRIMARY KEY DEFAULT TRUE,
+        mode TEXT DEFAULT 'live',  -- 'live' or 'test'
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+        INSERT INTO settings (id, mode) VALUES (TRUE, 'live')
+        ON CONFLICT (id) DO NOTHING;
+    """)
+    # indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_bets_bet_key ON bets(bet_key);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_bet_key ON user_bets(bet_key);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_bets_user ON user_bets(user_id);")
@@ -135,6 +150,36 @@ def _migrate():
     cur.close()
     conn.close()
     log.info("DB migration complete (using %s -> %s)", DB_VAR_NAME or "NONE", _mask(DATABASE_URL) if DB_OK else "N/A")
+
+def get_mode() -> str:
+    if not DB_OK:
+        return "live"
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT mode FROM settings WHERE id=TRUE;")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return (row["mode"] if row and row.get("mode") else "live")
+    except Exception:
+        log.exception("get_mode failed")
+        return "live"
+
+def set_mode(new_mode: str) -> bool:
+    if not DB_OK:
+        return False
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE settings SET mode=%s, updated_at=NOW() WHERE id=TRUE;", (new_mode,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception:
+        log.exception("set_mode failed")
+        return False
 
 def save_bet_row(bet: dict):
     if not DB_OK:
@@ -309,7 +354,7 @@ def calculate_bets(raw):
         for book in ev.get("bookmakers", []):
             if not _allowed_bookmaker(book.get("title", "")):
                 continue
-            for m in book.get("markets", []):
+            for m in book in book.get("markets", []):
                 mkey = m.get("key")
                 for out in m.get("outcomes", []):
                     price = out.get("price")
@@ -427,39 +472,66 @@ def embed_for_bet(title: str, bet: dict, color: int):
         f"🧠 **Smart Stake:** {bet['smart_units']} units → Payout: {round(bet['smart_units'] * bet['odds'], 2)} | Exp. Profit: {bet['smart_exp']}\n"
         f"🔥 **Aggressive Stake:** {bet['aggr_units']} units → Payout: {round(bet['aggr_units'] * bet['odds'], 2)} | Exp. Profit: {bet['aggr_exp']}\n"
     )
-    return discord.Embed(title=title, description=desc, color=color)
+    emb = discord.Embed(title=title, description=desc, color=color)
+    return emb
 
 # ----------------------------
-# Posting logic
+# Posting logic (respects mode + role alert)
 # ----------------------------
 async def post_bet_to_channels(bet: dict):
     # Save first (so buttons can fetch from DB even after restart)
     save_bet_row(bet)
 
+    # Determine mode
+    mode = get_mode()  # 'live' or 'test'
+
+    # Prepare embed/view
     title = "Quick Return Bet" if bet["category"] == "quick" else "Longer Play Bet"
     color = 0x2ecc71 if bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD else 0xe74c3c
     if bet.get("_is_best"):
         title = "Best Bet"
         color = 0xf1c40f
-
     emb  = embed_for_bet(title, bet, color)
     view = build_bet_view(bet)
 
-    ch_id = CH_QUICK if bet["category"] == "quick" else CH_LONG
+    # Post destination(s)
+    targets = []
     if bet.get("_is_best"):
-        ch_id = CH_BEST
-    channel = bot.get_channel(ch_id) if ch_id else None
-    if channel:
-        try:
-            await channel.send(embed=emb, view=view)
-        except Exception:
-            log.exception("Failed to send embed")
+        # Best bet goes to best channel; in test mode, also mirror to value test channel only if CH_VALUE set
+        if mode == "live" and CH_BEST:
+            targets.append(CH_BEST)
+        elif mode == "test" and CH_VALUE:
+            targets.append(CH_VALUE)
+    else:
+        if mode == "live":
+            ch_id = CH_QUICK if bet["category"] == "quick" else CH_LONG
+            if ch_id:
+                targets.append(ch_id)
+        elif mode == "test" and CH_VALUE:
+            targets.append(CH_VALUE)
 
-    if bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD and CH_VALUE:
+    # Duplicate value bets to value channel (testing stream) in both modes if configured
+    duplicate_to_value = (bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD and CH_VALUE)
+
+    # Send messages
+    for ch_id in targets:
+        channel = bot.get_channel(ch_id)
+        if channel:
+            try:
+                # Role ping for Best Bet if configured and in live mode
+                if bet.get("_is_best") and ALERT_ROLE_ID and mode == "live":
+                    role_mention = f"<@&{ALERT_ROLE_ID}>"
+                    await channel.send(content=role_mention)
+                await channel.send(embed=emb, view=view)
+            except Exception:
+                log.exception("Failed to send embed")
+
+    if duplicate_to_value:
         vch = bot.get_channel(CH_VALUE)
         if vch:
             try:
-                v_emb = embed_for_bet("Value Bet (Testing)", bet, 0x2ecc71)
+                v_title = "Value Bet (Testing)" if not bet.get("_is_best") else "Best Bet (Testing Mirror)"
+                v_emb = embed_for_bet(v_title, bet, 0x2ecc71 if not bet.get("_is_best") else 0xf1c40f)
                 await vch.send(embed=v_emb, view=view)
             except Exception:
                 log.exception("Failed duplicate to value channel")
@@ -536,16 +608,21 @@ async def handle_place_buttons(inter: discord.Interaction):
 
         ok = save_user_bet(inter.user, bet_payload, strategy, units, odds, ep)
         if ok:
+            # Ephemeral confirm
             await inter.followup.send(
                 f"Saved **{strategy.capitalize()}** bet for **{row['match']}** — {row['team']} | {units:.2f} units",
                 ephemeral=True
             )
+            # Light DM (optional, ignore errors)
+            try:
+                await inter.user.send(f"✅ Saved your {strategy} bet: {row['match']} — {row['team']} ({units:.2f} units at {odds})")
+            except Exception:
+                pass
         else:
             await inter.followup.send("❌ Could not save your bet. Is the database configured?", ephemeral=True)
 
     except Exception:
         log.exception("handle_place_buttons error")
-        # If we get here and haven't responded, Discord shows a generic error; we already deferred above.
 
 # ----------------------------
 # Scheduler
@@ -614,7 +691,8 @@ async def dblatest(ctx: discord.Interaction):
         log.exception("dblatest failed")
         await ctx.response.send_message("dblatest failed.", ephemeral=True)
 
-@bot.tree.command(name="stats", description="Paper-trade stats (bets, win rate, expected P&L, ROI)")
+# (#3) Stats with Top Performing League
+@bot.tree.command(name="stats", description="Paper-trade stats (bets, win rate, expected P&L, ROI) + best league")
 async def stats(ctx: discord.Interaction):
     if not DB_OK:
         await ctx.response.send_message("DB not configured.", ephemeral=True)
@@ -622,6 +700,7 @@ async def stats(ctx: discord.Interaction):
     try:
         conn = _connect()
         cur = conn.cursor()
+        # Per-strategy
         cur.execute("""
             SELECT
               ub.strategy,
@@ -635,7 +714,7 @@ async def stats(ctx: discord.Interaction):
             ORDER BY ub.strategy;
         """)
         per = cur.fetchall()
-
+        # Total
         cur.execute("""
             SELECT
               COUNT(*) AS n,
@@ -646,6 +725,21 @@ async def stats(ctx: discord.Interaction):
             LEFT JOIN bets b ON b.bet_key = ub.bet_key;
         """)
         total = cur.fetchone()
+        # Top league by ROI (min 5 bets)
+        cur.execute("""
+            SELECT
+              b.league,
+              COUNT(*) AS n,
+              COALESCE(SUM(ub.units),0) AS units,
+              COALESCE(SUM(ub.exp_profit),0) AS ep
+            FROM user_bets ub
+            JOIN bets b ON b.bet_key = ub.bet_key
+            GROUP BY b.league
+            HAVING COUNT(*) >= 5
+            ORDER BY (CASE WHEN COALESCE(SUM(ub.units),0) > 0 THEN COALESCE(SUM(ub.exp_profit),0) / COALESCE(SUM(ub.units),0) ELSE -999 END) DESC
+            LIMIT 1;
+        """)
+        top = cur.fetchone()
         cur.close()
         conn.close()
 
@@ -669,10 +763,78 @@ async def stats(ctx: discord.Interaction):
         roi = (ep / u * 100.0) if u > 0 else 0.0
         lines.append(f"\n**Total** → **{n} bets** | **{u:.2f} units** | **Win rate {wr:.2f}%** | **P&L {ep:.2f}** | **ROI {roi:.2f}%**")
 
+        if top and float(top["units"] or 0) > 0:
+            troi = float(top["ep"])/float(top["units"]) * 100.0
+            lines.append(f"\n🏆 **Top Performing League:** {top.get('league') or 'Unknown'} — ROI **{troi:.2f}%** over **{int(top['n'])}** bets")
+
         await ctx.response.send_message("\n".join(lines), ephemeral=True)
     except Exception:
         log.exception("/stats failed")
         await ctx.response.send_message("Stats failed.", ephemeral=True)
+
+# (#6) My bets (personal history)
+@bot.tree.command(name="mybets", description="Show your recent bets (optionally filter by strategy) and mini-stats")
+async def mybets(ctx: discord.Interaction, strategy: str | None = None, limit: int = 10):
+    if not DB_OK:
+        await ctx.response.send_message("DB not configured.", ephemeral=True)
+        return
+    limit = max(1, min(limit, 25))
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        if strategy:
+            cur.execute("""
+                SELECT ub.created_at, b.match, b.team, ub.strategy, ub.units, ub.odds, ub.exp_profit, b.league
+                FROM user_bets ub
+                LEFT JOIN bets b ON b.bet_key = ub.bet_key
+                WHERE ub.user_id=%s AND ub.strategy=%s
+                ORDER BY ub.created_at DESC
+                LIMIT %s;
+            """, (str(ctx.user.id), strategy.lower(), limit))
+        else:
+            cur.execute("""
+                SELECT ub.created_at, b.match, b.team, ub.strategy, ub.units, ub.odds, ub.exp_profit, b.league
+                FROM user_bets ub
+                LEFT JOIN bets b ON b.bet_key = ub.bet_key
+                WHERE ub.user_id=%s
+                ORDER BY ub.created_at DESC
+                LIMIT %s;
+            """, (str(ctx.user.id), limit))
+        rows = cur.fetchall()
+
+        # mini-stats for this user (and strategy if provided)
+        if strategy:
+            cur.execute("""
+                SELECT COUNT(*) AS n, COALESCE(SUM(units),0) AS units, COALESCE(SUM(exp_profit),0) AS ep
+                FROM user_bets
+                WHERE user_id=%s AND strategy=%s;
+            """, (str(ctx.user.id), strategy.lower()))
+        else:
+            cur.execute("""
+                SELECT COUNT(*) AS n, COALESCE(SUM(units),0) AS units, COALESCE(SUM(exp_profit),0) AS ep
+                FROM user_bets
+                WHERE user_id=%s;
+            """, (str(ctx.user.id),))
+        mini = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not rows:
+            await ctx.response.send_message("No bets saved yet.", ephemeral=True)
+            return
+
+        lines = [f"**Your last {len(rows)} bets**" + (f" (strategy: {strategy})" if strategy else "")]
+        for r in rows:
+            lines.append(f"• {r['created_at']:%d/%m/%y %H:%M} — {r['match']} — {r['team']} — {r['strategy']} | {float(r['units']):.2f}u @ {float(r['odds']):.2f} | Exp.P&L {float(r['exp_profit']):.2f} | {r.get('league') or 'League ?'}")
+
+        n = int(mini["n"] or 0); u = float(mini["units"] or 0); ep = float(mini["ep"] or 0)
+        roi = (ep/u*100.0) if u>0 else 0.0
+        lines.append(f"\n**Mini-Stats:** {n} bets | {u:.2f} units | P&L {ep:.2f} | ROI {roi:.2f}%")
+
+        await ctx.response.send_message("\n".join(lines), ephemeral=True)
+    except Exception:
+        log.exception("/mybets failed")
+        await ctx.response.send_message("mybets failed.", ephemeral=True)
 
 @bot.tree.command(name="dbsource", description="Show which DB env var the bot is using")
 async def dbsource(ctx: discord.Interaction):
@@ -683,6 +845,29 @@ async def dbsource(ctx: discord.Interaction):
         f"Using **{DB_VAR_NAME}**\n`{_mask(DATABASE_URL)}`",
         ephemeral=True
     )
+
+# (#8) Mode controls
+@bot.tree.command(name="setmode", description="Set bot mode: live or test (admin only)")
+@discord.app_commands.describe(mode="live or test")
+async def setmode_cmd(ctx: discord.Interaction, mode: str):
+    # Admin check: require Manage Guild
+    perms = ctx.user.guild_permissions if hasattr(ctx.user, "guild_permissions") else None
+    if not perms or not perms.manage_guild:
+        await ctx.response.send_message("You need **Manage Server** permission to change mode.", ephemeral=True)
+        return
+    mode = mode.lower().strip()
+    if mode not in ("live", "test"):
+        await ctx.response.send_message("Mode must be `live` or `test`.", ephemeral=True)
+        return
+    ok = set_mode(mode)
+    if ok:
+        await ctx.response.send_message(f"✅ Mode set to **{mode}**.", ephemeral=True)
+    else:
+        await ctx.response.send_message("❌ Failed to set mode.", ephemeral=True)
+
+@bot.tree.command(name="getmode", description="Show current bot mode")
+async def getmode_cmd(ctx: discord.Interaction):
+    await ctx.response.send_message(f"Current mode: **{get_mode()}**", ephemeral=True)
 
 # ----------------------------
 # Events
