@@ -1,633 +1,549 @@
-# bot.py  —  ValueBets (full build)
-
+# bot.py
 import os
-import asyncio
 import json
 import math
 import time
+import random
+import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
-
-import aiohttp
-import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from collections import defaultdict
 
 import discord
-from discord import app_commands
+from discord import app_commands, Interaction, Embed, Color
 from discord.ext import commands, tasks
 
-# ------------- Config & constants -------------
+import psycopg2
+import psycopg2.extras
+import requests
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-CH_BEST = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
-CH_QUICK = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
-CH_LONG = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
-CH_VALUE = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0"))  # your duplicate value-bets channel
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+# ------------- ENV -------------
+TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
+QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
+LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
+VALUE_DUP_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0"))  # optional
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip() or os.getenv("THEODDS_API_KEY", "").strip()
 
-DB_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL") or ""
+# Postgres connection (prefer DATABASE_URL, else DATABASE_PUBLIC_URL)
+DATABASE_URL = (
+    os.getenv("DATABASE_URL", "").strip()
+    or os.getenv("DATABASE_PUBLIC_URL", "").strip()
+)
 
-# base stakes in units
-CONSERVATIVE_UNITS = 15.0
-
-# bookmakers (limit to your 9)
-ALLOWED_BOOKMAKERS = {
+# ------------- CONSTANTS -------------
+BANKROLL_UNITS = 1000.0                  # “units” bankroll notion (not currency)
+CONSERVATIVE_PCT = 0.015                 # 1.5% conservative
+BOOKMAKER_WHITELIST = {
+    # Your 9 AU/UK books
     "sportsbet", "bet365", "ladbrokes", "tabtouch", "neds",
     "pointsbet", "dabble", "betfair", "tab"
 }
 
-# sport emoji map (covers commonly returned sports from the-odds-api)
-SPORT_EMOJIS = {
+# Sport emoji + league name mapper (league fallback “Unknown League”)
+SPORT_EMOJI = {
     "soccer": "⚽",
     "basketball": "🏀",
-    "americanfootball": "🏈",
-    "aussierules": "🏉",
     "tennis": "🎾",
-    "mma": "🥊",
+    "americanfootball": "🏈",
     "icehockey": "🏒",
     "baseball": "⚾",
-    "cricket": "🏏",
-    "esports": "🎮",
-    "golf": "⛳",
+    "aussierules": "🏉",
+    "mma": "🥊",
     "boxing": "🥊",
+    "cricket": "🏏",
+    "formula1": "🏎️",
     "rugbyleague": "🏉",
-    "rugbunion": "🏉",
-    "handball": "🤾",
+    "rugbynunion": "🏉",
 }
 
-# Discord intents
-intents = discord.Intents.default()
-intents.message_content = True
+# In-memory index of posted bets so our buttons know what to save
+# bet_key -> bet dict
+POSTED_BETS: dict[str, dict] = {}
 
-# Avoid duplicate CommandTree error
-class ValueBetsBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
-        # Single CommandTree instance
-        self.tree = app_commands.CommandTree(self)
+# ------------- DB HELPERS -------------
+def get_db_conn():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-bot = ValueBetsBot()
-
-# Odds API
-API_BASE = "https://api.the-odds-api.com/v4"
-
-# In-memory duplicate suppression per run
-posted_keys = set()
-
-# ------------- DB helpers -------------
-
-def get_db() -> psycopg2.extensions.connection:
-    if not DB_URL:
-        raise RuntimeError("DATABASE_URL / DATABASE_PUBLIC_URL is not set.")
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
-
-def init_db():
-    """Create tables if not exist, add columns (safe migrations)."""
-    conn = get_db()
+def ensure_schema():
+    """Create tables if missing and ensure all expected columns exist."""
+    if not DATABASE_URL:
+        return
+    conn = get_db_conn()
+    conn.autocommit = True
     cur = conn.cursor()
-
-    # paper-trading bets universe (system)
+    # bets table (for paper feed / auditing)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS bets (
-        id SERIAL PRIMARY KEY,
-        bet_key TEXT UNIQUE,
-        event_id TEXT,
-        match TEXT,
-        bookmaker TEXT,
-        team TEXT,
-        odds NUMERIC,
-        edge NUMERIC,
-        probability NUMERIC,
-        consensus NUMERIC,
-        bet_time TIMESTAMPTZ,
-        category TEXT,
-        sport TEXT,
-        league TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+        CREATE TABLE IF NOT EXISTS bets (
+          id SERIAL PRIMARY KEY,
+          event_id TEXT,
+          bet_key TEXT UNIQUE,
+          match TEXT,
+          bookmaker TEXT,
+          team TEXT,
+          odds NUMERIC,
+          edge NUMERIC,
+          bet_time TIMESTAMPTZ,
+          category TEXT,
+          sport TEXT,
+          league TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
     """)
-
-    # user bets (button clicks)
+    # user_bets table (button clicks by real users)
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS user_bets (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        username TEXT,
-        bet_key TEXT,
-        event_id TEXT,
-        sport TEXT,
-        league TEXT,
-        stake_type TEXT,      -- conservative/smart/aggressive
-        stake_units NUMERIC,
-        placed_at TIMESTAMPTZ DEFAULT NOW(),
-        result TEXT,          -- win/loss/push/void/NULL
-        pnl NUMERIC,          -- realized P/L units
-        settled_at TIMESTAMPTZ
-    );
+        CREATE TABLE IF NOT EXISTS user_bets (
+          id SERIAL PRIMARY KEY,
+          user_id BIGINT,
+          username TEXT,
+          bet_key TEXT,
+          event_id TEXT,
+          sport TEXT,
+          league TEXT,
+          stake_type TEXT,       -- 'conservative'|'smart'|'aggressive'
+          stake_units NUMERIC,
+          odds NUMERIC,
+          placed_at TIMESTAMPTZ DEFAULT NOW(),
+          -- paper-trading settlement:
+          result TEXT,           -- 'win'|'loss'|'void'|NULL
+          settled_at TIMESTAMPTZ,
+          pnl_units NUMERIC
+        );
     """)
-
-    # safe add columns (in case older schema exists)
-    safe_add = [
-        ("bets", "league", "TEXT"),
-        ("bets", "sport", "TEXT"),
-        ("bets", "probability", "NUMERIC"),
-        ("bets", "consensus", "NUMERIC")
-    ]
-    for table, col, typ in safe_add:
+    # add missing columns defensively (safe to run repeatedly)
+    for (table, col, typ) in [
+        ("user_bets", "stake_type", "TEXT"),
+        ("user_bets", "pnl_units", "NUMERIC"),
+        ("user_bets", "result", "TEXT"),
+        ("user_bets", "settled_at", "TIMESTAMPTZ"),
+        ("user_bets", "league", "TEXT"),
+    ]:
         cur.execute(f"""
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_name='{table}' AND column_name='{col}' ;
+          DO $$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+               WHERE table_name='{table}'
+                 AND column_name='{col}'
+            ) THEN
+              ALTER TABLE {table} ADD COLUMN {col} {typ};
+            END IF;
+          END$$;
         """)
-        if cur.fetchone() is None:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ};")
-
-    conn.commit()
     cur.close()
     conn.close()
 
-def upsert_bet(b: Dict[str, Any]):
-    conn = get_db()
+def save_bet_row(bet: dict):
+    """Insert the bet in bets table (ignore if exists)."""
+    if not DATABASE_URL: 
+        return
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO bets (bet_key, event_id, match, bookmaker, team, odds, edge, probability, consensus,
-                          bet_time, category, sport, league)
-        VALUES (%(bet_key)s, %(event_id)s, %(match)s, %(bookmaker)s, %(team)s, %(odds)s, %(edge)s,
-                %(probability)s, %(consensus)s, %(bet_time)s, %(category)s, %(sport)s, %(league)s)
-        ON CONFLICT (bet_key) DO UPDATE SET
-            edge = EXCLUDED.edge,
-            probability = EXCLUDED.probability,
-            consensus = EXCLUDED.consensus,
-            bet_time = EXCLUDED.bet_time,
-            category = EXCLUDED.category,
-            sport = EXCLUDED.sport,
-            league = EXCLUDED.league;
-    """, b)
+      INSERT INTO bets (event_id, bet_key, match, bookmaker, team, odds, edge, bet_time,
+                        category, sport, league)
+      VALUES (%(event_id)s, %(bet_key)s, %(match)s, %(bookmaker)s, %(team)s, %(odds)s,
+              %(edge)s, %(bet_time)s, %(category)s, %(sport)s, %(league)s)
+      ON CONFLICT (bet_key) DO NOTHING;
+    """, bet)
     conn.commit()
     cur.close()
     conn.close()
 
-def save_user_bet(user_id: int, username: str, stake_type: str, stake_units: float,
-                  bet_key: str) -> Tuple[bool, str]:
-    """Save a user bet; returns success and message."""
-    conn = get_db()
+def save_user_bet(user: discord.User | discord.Member, bet: dict, stake_type: str, stake_units: float) -> int:
+    """Insert a user's placed bet; returns inserted id."""
+    if not DATABASE_URL:
+        raise RuntimeError("DB not configured")
+    conn = get_db_conn()
     cur = conn.cursor()
-    # ensure bet exists (ingested)
-    cur.execute("SELECT * FROM bets WHERE bet_key=%s", (bet_key,))
+    cur.execute("""
+      INSERT INTO user_bets
+        (user_id, username, bet_key, event_id, sport, league, stake_type, stake_units, odds)
+      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+      RETURNING id;
+    """, (
+        int(user.id), str(user.name), bet["bet_key"], bet.get("event_id"),
+        bet.get("sport"), bet.get("league"), stake_type, stake_units, bet.get("odds")
+    ))
+    row_id = cur.fetchone()["id"]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row_id
+
+def db_agg_total() -> dict:
+    """System-wide paper-stats from user_bets."""
+    if not DATABASE_URL:
+        return {"bets": 0, "staked": 0.0, "pnl": 0.0, "wins": 0, "settled": 0}
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT
+        COUNT(*)::INT as bets,
+        COALESCE(SUM(stake_units),0) as staked,
+        COALESCE(SUM(pnl_units),0) as pnl,
+        COALESCE(SUM(CASE WHEN result='win' THEN 1 ELSE 0 END),0)::INT as wins,
+        COALESCE(SUM(CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END),0)::INT as settled
+      FROM user_bets;
+    """)
     row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return False, "Sorry, I couldn't find this bet yet. Please try again in a few seconds."
+    cur.close(); conn.close()
+    return row
 
+def db_agg_user(user_id: int) -> dict:
+    if not DATABASE_URL:
+        return {"bets": 0, "staked": 0.0, "pnl": 0.0, "wins": 0, "settled": 0}
+    conn = get_db_conn()
+    cur = conn.cursor()
     cur.execute("""
-        INSERT INTO user_bets (user_id, username, bet_key, event_id, sport, league, stake_type, stake_units)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING id;
-    """, (user_id, username, row["bet_key"], row["event_id"], row["sport"], row["league"],
-          stake_type, stake_units))
-    new_id = cur.fetchone()["id"]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return True, f"Saved your {stake_type} bet ({stake_units:.2f} units). Entry #{new_id}."
+      SELECT
+        COUNT(*)::INT as bets,
+        COALESCE(SUM(stake_units),0) as staked,
+        COALESCE(SUM(pnl_units),0) as pnl,
+        COALESCE(SUM(CASE WHEN result='win' THEN 1 ELSE 0 END),0)::INT as wins,
+        COALESCE(SUM(CASE WHEN result IS NOT NULL THEN 1 ELSE 0 END),0)::INT as settled
+      FROM user_bets
+      WHERE user_id = %s;
+    """, (user_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return row
 
-# ------------- Odds logic -------------
+# ------------- ODDS FETCH (TheOddsAPI) -------------
+def allowed_book(title: str) -> bool:
+    return any(k in (title or "").lower() for k in BOOKMAKER_WHITELIST)
 
-def _allowed_bookmaker(title: str) -> bool:
-    t = (title or "").lower().replace(" ", "")
-    return any(bk in t for bk in ALLOWED_BOOKMAKERS)
-
-def _edge(prob_consensus: float, implied: float) -> float:
-    # edge% = (consensus - implied) * 100
-    return round((prob_consensus - implied) * 100.0, 2)
-
-def _consensus_for_outcome(consensus_parts: Dict[str, List[float]], key: str, fallback: float) -> float:
-    lst = consensus_parts.get(key)
-    if not lst:
-        return fallback
-    return sum(lst)/len(lst)
-
-def _sport_and_league(event: Dict[str, Any]) -> Tuple[str, str]:
-    # TheOddsAPI returns "sport_title": e.g. "Soccer - Brazil Serie B"
-    # We'll split on " - " to get league; sport key is e.g. "soccer"
-    sport_key = (event.get("sport_key") or "").lower()
-    sport_title = event.get("sport_title") or ""
-    league = "Unknown League"
-    if sport_title:
-        # try to extract text after " - "
-        parts = sport_title.split(" - ", 1)
-        if len(parts) == 2:
-            league = parts[1]
-        else:
-            # if no dash, use sport_title as league
-            league = sport_title
-    return sport_key, league
-
-async def fetch_odds(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+def theodds_fetch_upcoming():
+    """Fetch a small sample for /fetchbets on-demand (safe on credits)."""
+    url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
-        "regions": "au,us,uk",
+        "regions": "au,uk,us",
         "markets": "h2h,spreads,totals",
         "oddsFormat": "decimal"
     }
-    url = f"{API_BASE}/sports/upcoming/odds/"
-    async with session.get(url, params=params, timeout=20) as resp:
-        if resp.status == 200:
-            return await resp.json()
-        else:
-            txt = await resp.text()
-            print("Odds API error:", resp.status, txt)
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
             return []
+        return r.json()
+    except Exception:
+        return []
 
-def format_units(u: float) -> str:
-    return f"{u:.2f} units" if u < 1000 else f"{int(round(u))} units"
-
-def stake_suggestions(edge_pct: float) -> Tuple[float, float, float]:
-    # conservative fixed, smart Kelly-ish, aggressive scales with edge
-    cons = CONSERVATIVE_UNITS
-    # Kelly fraction ~ edge% / odds. We’ll approximate using edge factor safely
-    edge_f = max(edge_pct/100.0, 0.0)
-    smart = max(round(cons * (0.25 + edge_f*1.5), 2), 0.5)
-    aggr = round(cons * (1.0 + edge_f*5.0), 2)
-    return cons, smart, aggr
-
-def make_bet_key(event_id: str, bookmaker: str, market_key: str, outcome_name: str) -> str:
-    return f"{event_id}|{bookmaker}|{market_key}|{outcome_name}"
-
-def category_for_delta(d: timedelta) -> str:
-    if d <= timedelta(hours=48):
-        return "quick"
-    elif d <= timedelta(days=150):
-        return "long"
-    return "ignore"
-
-def pick_best(bets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    # Choose best by (consensus prob * edge) as combined score, but ensure value (edge>0.5)
-    ranked = [b for b in bets if b["edge"] >= 0.5]
-    if not ranked:
-        return None
-    ranked.sort(key=lambda x: (x["probability"]*x["edge"]), reverse=True)
-    return ranked[0]
-
-def embed_from_bet(b: Dict[str, Any], title: str, color: discord.Color) -> discord.Embed:
-    # value indicator
-    indicator = "🟢 Value Bet" if b["edge"] >= 2.0 else "🛑 Low Value"
-    sport_key = b["sport"] or ""
-    emoji = SPORT_EMOJIS.get(sport_key, "🎲")
-    league = b.get("league") or "Unknown League"
-
-    desc = (
-        f"{indicator}\n\n"
-        f"**{emoji} {sport_key.capitalize()} ({league})**\n\n"
-        f"**Match:** {b['match']}\n"
-        f"**Pick:** {b['team']} @ {b['odds']}\n"
-        f"**Bookmaker:** {b['bookmaker']}\n"
-        f"**Consensus %:** {b['consensus']:.2f}%\n"
-        f"**Implied %:** {b['probability']*100:.2f}%\n"
-        f"**Edge:** {b['edge']:.2f}%\n"
-        f"**Time:** {b['bet_time'].strftime('%d/%m/%y %H:%M')}\n\n"
-    )
-    cons, smart, aggr = stake_suggestions(b["edge"])
-    desc += (
-        f"💵 **Conservative Stake:** {format_units(cons)} → "
-        f"Payout: {format_units(cons*b['odds'])} | Exp. Profit: {format_units((b['consensus']/100.0)*cons*b['odds'] - cons)}\n"
-        f"🧠 **Smart Stake:** {format_units(smart)} → "
-        f"Payout: {format_units(smart*b['odds'])} | Exp. Profit: {format_units((b['consensus']/100.0)*smart*b['odds'] - smart)}\n"
-        f"🔥 **Aggressive Stake:** {format_units(aggr)} → "
-        f"Payout: {format_units(aggr*b['odds'])} | Exp. Profit: {format_units((b['consensus']/100.0)*aggr*b['odds'] - aggr)}\n"
-    )
-    emb = discord.Embed(title=title, description=desc, color=color)
-    emb.set_footer(text=b["bet_key"])
-    return emb
-
-def stake_buttons(bet_key: str) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    for label, style, skey in [
-        ("Conservative", discord.ButtonStyle.success, "conservative"),
-        ("Smart", discord.ButtonStyle.primary, "smart"),
-        ("Aggressive", discord.ButtonStyle.danger, "aggressive"),
-    ]:
-        custom = json.dumps({"t": "stake", "k": bet_key, "s": skey})
-        view.add_item(discord.ui.Button(label=label, style=style, custom_id=custom))
-    return view
-
-# ------------- Bot tasks -------------
-
-async def fetch_and_post():
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_odds(session)
+def compute_bets_from_payload(payload):
+    """Very similar to what you had — compute bets & classifications."""
     now = datetime.now(timezone.utc)
-    all_bets: List[Dict[str, Any]] = []
-
-    for event in data:
-        event_id = event.get("id") or event.get("event_id") or ""
-        home, away = event.get("home_team"), event.get("away_team")
+    results = []
+    for ev in payload:
+        home = ev.get("home_team"); away = ev.get("away_team")
+        if not home or not away: 
+            continue
         match_name = f"{home} vs {away}"
-        commence = event.get("commence_time")
+        commence = ev.get("commence_time")
         try:
-            commence_dt = datetime.fromisoformat(commence.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(commence.replace("Z", "+00:00"))
         except Exception:
             continue
-
-        delta = commence_dt - now
-        cat = category_for_delta(delta)
-        if cat == "ignore":
+        if dt <= now or dt > now + timedelta(days=150):
             continue
 
-        sport_key, league = _sport_and_league(event)
+        # sport key + league try from event
+        sport_key = (ev.get("sport_key") or "").lower()
+        league = ev.get("sport_title") or ev.get("sport_title_long") or "Unknown League"
+        sport_emoji = SPORT_EMOJI.get(sport_key, "🎲")
 
-        # consensus probability per outcome across books (by market key + outcome name)
-        consensus_parts: Dict[str, List[float]] = {}
-        for bk in event.get("bookmakers", []):
-            if not _allowed_bookmaker(bk.get("title", "")):
+        # consensus from allowed books
+        cs_map = defaultdict(list)
+        for bk in ev.get("bookmakers", []):
+            if not allowed_book(bk.get("title", "")):
                 continue
-            for market in bk.get("markets", []):
-                mkey = market.get("key")
-                for outc in market.get("outcomes", []):
-                    price = outc.get("price")
-                    name = outc.get("name")
-                    if not price or not name:
-                        continue
-                    implied = 1.0/float(price)
-                    k = f"{mkey}:{name}"
-                    consensus_parts.setdefault(k, []).append(implied)
+            for m in bk.get("markets", []):
+                for oc in m.get("outcomes", []):
+                    nm = oc.get("name"); pr = oc.get("price")
+                    if nm and pr:
+                        cs_map[f"{m['key']}:{nm}"].append(1/float(pr))
 
-        # average fallback
-        flat = [x for v in consensus_parts.values() for x in v]
-        global_avg = sum(flat)/len(flat) if flat else 0.5
+        if not cs_map:
+            continue
+        # global consensus fallback
+        tot_ps = [p for arr in cs_map.values() for p in arr]
+        global_c = sum(tot_ps) / max(1, len(tot_ps))
 
-        for bk in event.get("bookmakers", []):
-            title = bk.get("title", "Unknown")
-            if not _allowed_bookmaker(title):
+        # each offered
+        for bk in ev.get("bookmakers", []):
+            if not allowed_book(bk.get("title", "")): 
                 continue
-            for market in bk.get("markets", []):
-                mkey = market.get("key")
-                for outc in market.get("outcomes", []):
-                    price = outc.get("price")
-                    name = outc.get("name")
-                    if not price or not name:
+            for m in bk.get("markets", []):
+                for oc in m.get("outcomes", []):
+                    nm = oc.get("name"); pr = oc.get("price")
+                    if not nm or not pr:
                         continue
-                    implied = 1.0/float(price)
-                    cons_prob = _consensus_for_outcome(consensus_parts, f"{mkey}:{name}", global_avg)
-                    ed = _edge(cons_prob, implied)
-                    if ed <= 0:
+                    implied = 1/float(pr)
+                    keyo = f"{m['key']}:{nm}"
+                    consensus = (sum(cs_map[keyo])/len(cs_map[keyo])) if keyo in cs_map else global_c
+                    edge = (consensus - implied) * 100.0
+                    if edge <= 0:
                         continue
+                    # classification
+                    delta = dt - now
+                    quick = (delta <= timedelta(hours=48))
+                    longp = (delta > timedelta(hours=48))
+                    category = "quick" if quick else "long" if longp else "other"
 
-                    bet_key = make_bet_key(event_id, title, mkey, name)
+                    # stake units
+                    conservative_units = round(BANKROLL_UNITS*CONSERVATIVE_PCT, 2)
+                    smart_units = round(conservative_units * max(1.0, (consensus*100)/50.0), 2)
+                    aggressive_units = round(conservative_units * (1 + (edge/10.0)), 2)
+
+                    bet_key = f"{match_name}|{nm}|{bk['title']}|{dt.isoformat()}"
+
                     bet = {
+                        "event_id": ev.get("id") or bet_key,
                         "bet_key": bet_key,
-                        "event_id": event_id,
                         "match": match_name,
-                        "bookmaker": title,
-                        "team": name,
-                        "odds": float(price),
-                        "edge": ed,
-                        "probability": implied,
-                        "consensus": cons_prob*100.0,
-                        "bet_time": commence_dt,
-                        "category": cat,
-                        "sport": sport_key,
-                        "league": league
+                        "bookmaker": bk.get("title", "Unknown"),
+                        "team": nm,
+                        "odds": float(pr),
+                        "edge": round(edge, 2),
+                        "probability": round(consensus*100, 2),
+                        "consensus": round(consensus*100, 2),
+                        "bet_time": dt,
+                        "category": category,
+                        "quick_return": quick,
+                        "long_play": longp,
+                        "sport": sport_key or "unknown",
+                        "league": league,
+                        "emoji": sport_emoji,
+                        "conservative_units": conservative_units,
+                        "smart_units": smart_units,
+                        "aggressive_units": aggressive_units
                     }
-                    all_bets.append(bet)
+                    results.append(bet)
+    return results
 
-    # choose best (if any) ensuring it's a value (edge >= 0.5)
-    best = pick_best(all_bets)
+# ------------- EMBEDS + BUTTONS -------------
+def value_indicator(edge_pct: float) -> str:
+    return "🟢 Value Bet" if edge_pct >= 2 else "🛑 Low Value"
 
-    # post
-    if best:
-        if best["bet_key"] not in posted_keys:
-            posted_keys.add(best["bet_key"])
-            ch = bot.get_channel(CH_BEST)
-            if ch:
-                emb = embed_from_bet(best, "⭐ Best Bet", discord.Color.gold())
-                await ch.send(embed=emb, view=stake_buttons(best["bet_key"]))
-            # duplicate to value-channel too
-            if CH_VALUE:
-                chv = bot.get_channel(CH_VALUE)
-                if chv:
-                    emb = embed_from_bet(best, "⭐ Best Bet", discord.Color.gold())
-                    await chv.send(embed=emb, view=stake_buttons(best["bet_key"]))
-            upsert_bet(best)
+def bet_embed(bet: dict, title: str, color: int) -> Embed:
+    ind = value_indicator(bet["edge"])
+    sport_line = f"{bet['emoji']} {bet['sport'].title()} ({bet.get('league') or 'Unknown League'})"
+    desc = (
+        f"{ind}\n\n"
+        f"**{sport_line}**\n\n"
+        f"**Match:** {bet['match']}\n"
+        f"**Pick:** {bet['team']} @ {bet['odds']}\n"
+        f"**Bookmaker:** {bet['bookmaker']}\n"
+        f"**Consensus %:** {bet['consensus']}%\n"
+        f"**Implied %:** {round((1/bet['odds'])*100,2)}%\n"
+        f"**Edge:** {bet['edge']}%\n"
+        f"**Time:** {bet['bet_time'].strftime('%d/%m/%y %H:%M')}\n\n"
+        f"💵 **Conservative Stake:** {bet['conservative_units']} units\n"
+        f"🧠 **Smart Stake:** {bet['smart_units']} units\n"
+        f"🔥 **Aggressive Stake:** {bet['aggressive_units']} units\n"
+    )
+    e = Embed(title=title, description=desc, color=color)
+    e.set_footer(text="Click a stake button below to record your paper-trade.")
+    return e
 
-    # quick + long (also send to value channel)
-    for bet in all_bets:
-        if bet["bet_key"] in posted_keys:
-            # ensure DB upsert
-            upsert_bet(bet)
-            continue
+class StakeButtons(discord.ui.View):
+    def __init__(self, bet_key: str, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.bet_key = bet_key
 
-        title = "⏱ Quick Return Bet" if bet["category"] == "quick" else "📅 Longer Play Bet"
-        color = discord.Color.green() if bet["edge"] >= 2.0 else discord.Color.dark_grey()
-        channel_id = CH_QUICK if bet["category"] == "quick" else CH_LONG
-        ch = bot.get_channel(channel_id)
-        if ch:
-            posted_keys.add(bet["bet_key"])
-            emb = embed_from_bet(bet, title, color)
-            await ch.send(embed=emb, view=stake_buttons(bet["bet_key"]))
-        # duplicate to value channel
-        if CH_VALUE:
-            chv = bot.get_channel(CH_VALUE)
-            if chv:
-                emb = embed_from_bet(bet, title, color)
-                await chv.send(embed=emb, view=stake_buttons(bet["bet_key"]))
-        upsert_bet(bet)
+    @discord.ui.button(label="Conservative", emoji="💵", style=discord.ButtonStyle.secondary)
+    async def cons_btn(self, interaction: Interaction, button: discord.ui.Button):
+        await self._save(interaction, "conservative")
 
-# background loop
-@tasks.loop(minutes=5)
-async def bet_loop():
-    try:
-        await fetch_and_post()
-    except Exception as e:
-        print("bet_loop error:", e)
+    @discord.ui.button(label="Smart", emoji="🧠", style=discord.ButtonStyle.primary)
+    async def smart_btn(self, interaction: Interaction, button: discord.ui.Button):
+        await self._save(interaction, "smart")
 
-# ------------- Interaction handlers -------------
+    @discord.ui.button(label="Aggressive", emoji="🔥", style=discord.ButtonStyle.danger)
+    async def aggr_btn(self, interaction: Interaction, button: discord.ui.Button):
+        await self._save(interaction, "aggressive")
 
-@bot.event
-async def on_interaction(inter: discord.Interaction):
-    try:
-        if inter.type == discord.InteractionType.component and inter.data:
-            data = json.loads(inter.data.get("custom_id", "{}"))
-            if data.get("t") == "stake":
-                bet_key = data.get("k")
-                skey = data.get("s")
-                if skey not in {"conservative", "smart", "aggressive"}:
-                    await inter.response.send_message("Unknown stake.", ephemeral=True)
-                    return
-
-                # need the bet to compute stake suggestions
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute("SELECT * FROM bets WHERE bet_key=%s", (bet_key,))
-                row = cur.fetchone()
-                cur.close()
-                conn.close()
-                if not row:
-                    await inter.response.send_message(
-                        "Sorry, I couldn't find this bet yet. Please try again in a few seconds.",
-                        ephemeral=True
-                    )
-                    return
-
-                cons, smart, aggr = stake_suggestions(float(row["edge"]))
-                stake_map = {
-                    "conservative": cons,
-                    "smart": smart,
-                    "aggressive": aggr
-                }
-                stake_units = stake_map[skey]
-                ok, msg = save_user_bet(inter.user.id, inter.user.name, skey, stake_units, bet_key)
-                await inter.response.send_message(msg, ephemeral=True)
-    except Exception as e:
+    async def _save(self, interaction: Interaction, stake_type: str):
+        bet = POSTED_BETS.get(self.bet_key)
+        if not bet:
+            await interaction.response.send_message(
+                "Sorry, I couldn't find this bet yet. Please try again in a few seconds.",
+                ephemeral=True
+            )
+            return
+        units = {
+            "conservative": bet["conservative_units"],
+            "smart": bet["smart_units"],
+            "aggressive": bet["aggressive_units"]
+        }[stake_type]
         try:
-            await inter.response.send_message(f"⚠️ Error: {e}", ephemeral=True)
-        except:
-            pass
+            row_id = save_user_bet(interaction.user, bet, stake_type, units)
+        except Exception:
+            await interaction.response.send_message(
+                "❌ Could not save your bet. Is the database configured?",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"✅ Saved your **{stake_type}** bet ({units} units). Entry #{row_id}.",
+            ephemeral=True
+        )
 
-# ------------- Commands -------------
+# ------------- DISCORD BOT -------------
+intents = discord.Intents.default()
+intents.message_content = True
 
-@bot.tree.command(name="ping", description="Bot latency check")
-async def ping_cmd(inter: discord.Interaction):
-    await inter.response.send_message(f"Pong! {round(bot.latency*1000)}ms", ephemeral=True)
+class ValueBetsBot(commands.Bot):
+    def __init__(self):
+        # DO NOT create a CommandTree yourself; Bot already has one.
+        super().__init__(command_prefix="!", intents=intents)
+        self.synced = False
 
-@bot.tree.command(name="fetchbets", description="Manually fetch & post new bets now")
-async def fetchbets_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True, thinking=True)
-    try:
-        await fetch_and_post()
-        await inter.followup.send("✅ Fetched and posted (if any).", ephemeral=True)
-    except Exception as e:
-        await inter.followup.send(f"❌ Error: {e}", ephemeral=True)
+    async def setup_hook(self):
+        ensure_schema()
 
-@bot.tree.command(name="stats", description="Your personal performance (paper trading)")
-async def stats_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True, thinking=True)
-    conn = get_db()
-    cur = conn.cursor()
-    uid = inter.user.id
-
-    # personal realized
-    cur.execute("""
-        SELECT 
-            COUNT(*) AS total_bets,
-            COALESCE(SUM(CASE WHEN result='win' THEN 1 WHEN result='loss' THEN 0 END),0) AS wins,
-            COALESCE(SUM(pnl),0) AS pnl
-        FROM user_bets
-        WHERE user_id=%s
-    """, (uid,))
-    r = cur.fetchone()
-    total_bets = int(r["total_bets"] or 0)
-    wins = int(r["wins"] or 0)
-    pnl = float(r["pnl"] or 0.0)
-    winrate = (wins/total_bets*100.0) if total_bets else 0.0
-
-    # expected
-    # join to bets to compute expected pnl from consensus
-    cur.execute("""
-        SELECT ub.stake_units, b.odds, b.consensus
-        FROM user_bets ub
-        JOIN bets b ON b.bet_key=ub.bet_key
-        WHERE ub.user_id=%s
-    """, (uid,))
-    rows = cur.fetchall()
-    exp = 0.0
-    stake_sum = 0.0
-    for rr in rows:
-        stake = float(rr["stake_units"] or 0.0)
-        odds = float(rr["odds"] or 0.0)
-        cons = float(rr["consensus"] or 0.0)/100.0
-        exp += cons*stake*odds - stake
-        stake_sum += stake
-    roi_real = (pnl/stake_sum*100.0) if stake_sum else 0.0
-    roi_exp = (exp/stake_sum*100.0) if stake_sum else 0.0
-
-    cur.close()
-    conn.close()
-
-    msg = (
-        f"**Your Stats (@{inter.user.name})**\n"
-        f"Total bets: **{total_bets}**\n"
-        f"Win rate: **{winrate:.2f}%**\n"
-        f"Realized P/L: **{pnl:.2f} units** | ROI: **{roi_real:.2f}%**\n"
-        f"Expected P/L: **{exp:.2f} units** | Exp. ROI: **{roi_exp:.2f}%**\n"
-    )
-    await inter.followup.send(msg, ephemeral=True)
-
-@bot.tree.command(name="roi", description="System-wide ROI (paper trading)")
-async def roi_cmd(inter: discord.Interaction):
-    await inter.response.defer(ephemeral=True, thinking=True)
-    conn = get_db()
-    cur = conn.cursor()
-
-    # realized
-    cur.execute("""
-        SELECT 
-            COALESCE(SUM(pnl),0) AS pnl,
-            COALESCE(SUM(stake_units),0) AS st
-        FROM user_bets
-    """)
-    r = cur.fetchone()
-    pnl_all = float(r["pnl"] or 0.0)
-    stake_all = float(r["st"] or 0.0)
-    roi_real = (pnl_all/stake_all*100.0) if stake_all else 0.0
-
-    # expected (join on bets)
-    cur.execute("""
-        SELECT ub.stake_units, b.odds, b.consensus
-        FROM user_bets ub
-        JOIN bets b ON b.bet_key=ub.bet_key
-    """)
-    rows = cur.fetchall()
-    exp = 0.0
-    st2 = 0.0
-    for rr in rows:
-        stake = float(rr["stake_units"] or 0.0)
-        odds = float(rr["odds"] or 0.0)
-        cons = float(rr["consensus"] or 0.0)/100.0
-        exp += cons*stake*odds - stake
-        st2 += stake
-
-    roi_exp = (exp/st2*100.0) if st2 else 0.0
-    cur.close()
-    conn.close()
-
-    msg = (
-        f"**System ROI**\n"
-        f"Realized P/L: **{pnl_all:.2f} units** | ROI: **{roi_real:.2f}%** (across all users)\n"
-        f"Expected P/L: **{exp:.2f} units** | Exp. ROI: **{roi_exp:.2f}%**\n"
-    )
-    await inter.followup.send(msg, ephemeral=True)
-
-# ------------- Startup -------------
+bot = ValueBetsBot()
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    # sync commands fresh each boot (avoids stale state)
-    try:
+    if not bot.synced:
         await bot.tree.sync()
-        print("✅ Slash commands synced.")
-    except Exception as e:
-        print("Slash sync failed:", e)
+        bot.synced = True
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # init DB
+# -------- /ping ----------
+@bot.tree.command(name="ping", description="Check bot latency.")
+async def ping_cmd(interaction: Interaction):
+    await interaction.response.send_message(f"Pong! {round(bot.latency*1000)}ms", ephemeral=True)
+
+# -------- /fetchbets ----
+@bot.tree.command(name="fetchbets", description="Manually fetch a preview of incoming bets.")
+async def fetchbets_cmd(interaction: Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    payload = theodds_fetch_upcoming()
+    if not payload:
+        await interaction.followup.send("No odds available (or API limit/unauthorized).", ephemeral=True)
+        return
+    bets = compute_bets_from_payload(payload)
+    if not bets:
+        await interaction.followup.send("No value bets found right now.", ephemeral=True)
+        return
+
+    # Show the first 3 as preview only
+    lines = []
+    for b in bets[:3]:
+        lines.append(f"**{b['match']}** · {b['team']} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%")
+    await interaction.followup.send("🎲 Bets Preview:\n" + "\n".join(lines), ephemeral=True)
+
+# -------- /roi (system-wide) ----
+@bot.tree.command(name="roi", description="System-wide ROI (all recorded user paper trades).")
+async def roi_cmd(interaction: Interaction):
+    agg = db_agg_total()
+    staked = float(agg["staked"])
+    pnl = float(agg["pnl"])
+    roi = (pnl / staked * 100.0) if staked > 0 else 0.0
+    wr = (agg["wins"] / agg["settled"] * 100.0) if agg["settled"] > 0 else 0.0
+    msg = (f"📊 **System ROI**\n"
+           f"- Bets: {agg['bets']}\n"
+           f"- Staked: {staked:.2f} units\n"
+           f"- P/L: {pnl:.2f} units\n"
+           f"- ROI: {roi:.2f}%\n"
+           f"- Win rate (settled): {wr:.2f}%")
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# -------- /stats (personal) ----
+@bot.tree.command(name="stats", description="Your personal paper-trading stats.")
+async def stats_cmd(interaction: Interaction):
+    agg = db_agg_user(interaction.user.id)
+    staked = float(agg["staked"])
+    pnl = float(agg["pnl"])
+    roi = (pnl / staked * 100.0) if staked > 0 else 0.0
+    wr = (agg["wins"] / agg["settled"] * 100.0) if agg["settled"] > 0 else 0.0
+    msg = (f"🧾 **Your Stats**\n"
+           f"- Bets: {agg['bets']}\n"
+           f"- Staked: {staked:.2f} units\n"
+           f"- P/L: {pnl:.2f} units\n"
+           f"- ROI: {roi:.2f}%\n"
+           f"- Win rate (settled): {wr:.2f}%")
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# ------------- Posting helpers (used by your loop or elsewhere) -------------
+async def post_bet_to_channels(bet: dict):
+    """Posts a single bet embed with buttons; duplicates to VALUE_DUP_CHANNEL if configured."""
+    # Decide destination by category
+    channel_id = BEST_BETS_CHANNEL
+    title = "⭐ Best Bet"
+    color = Color.gold().value
+
+    # best pick = combine probability & edge; you can customize outside
+    if bet.get("quick_return"):
+        channel_id = QUICK_RETURNS_CHANNEL
+        title = "⏱ Quick Return Bet"
+        color = 0x2ECC71  # green
+    elif bet.get("long_play"):
+        channel_id = LONG_PLAYS_CHANNEL
+        title = "📅 Longer Play Bet"
+        color = 0x3498DB  # blue
+
+    e = bet_embed(bet, title, color)
+    view = StakeButtons(bet["bet_key"])
+
+    # index this bet for button callbacks
+    POSTED_BETS[bet["bet_key"]] = bet
+    # persist in bets table for auditing/paper feed
     try:
-        init_db()
-        print("✅ DB ready.")
-    except Exception as e:
-        print("DB init failed:", e)
+        save_bet_row(bet)
+    except Exception:
+        pass
 
+    # main channel
+    if channel_id:
+        ch = bot.get_channel(channel_id)
+        if ch:
+            await ch.send(embed=e, view=view)
+
+    # duplicate Value channel (testing)
+    if VALUE_DUP_CHANNEL:
+        ch2 = bot.get_channel(VALUE_DUP_CHANNEL)
+        if ch2:
+            # title override for test channel
+            e2 = bet_embed(bet, "⭐ Value Bet (Testing)", Color.green().value)
+            await ch2.send(embed=e2, view=StakeButtons(bet["bet_key"]))
+
+# ------------- Example background loop (optional) -------------
+@tasks.loop(minutes=5)
+async def bet_loop():
+    if not ODDS_API_KEY:
+        return
+    payload = theodds_fetch_upcoming()
+    if not payload:
+        return
+    bets = compute_bets_from_payload(payload)
+    if not bets:
+        return
+
+    # pick a few best (example: top by edge)
+    bets.sort(key=lambda x: (x["edge"], x["consensus"]), reverse=True)
+    for b in bets[:5]:
+        try:
+            await post_bet_to_channels(b)
+            await asyncio.sleep(1.0)
+        except Exception:
+            continue
+
+@bot.event
+async def on_connect():
+    # start loop if not running
     if not bet_loop.is_running():
         bet_loop.start()
 
-# ------------- Run -------------
-
+# ------------- RUN -------------
 if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN")
 
 bot.run(TOKEN)
+
 
 
 
