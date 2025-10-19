@@ -1,12 +1,10 @@
 import os
 import json
-import math
-import asyncio
 from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import tasks, commands
+from discord.ext import commands
 
 import psycopg2
 import psycopg2.extras
@@ -28,13 +26,8 @@ DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 
-class VB(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=INTENTS)
-        self.tree = app_commands.CommandTree(self)
-        self.db_conn = None
-
-bot = VB()
+# Use Bot directly; Bot already has .tree
+bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ===================
 # DATABASE UTILITIES
@@ -43,11 +36,10 @@ bot = VB()
 def get_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL environment variable not set.")
-    if bot.db_conn is not None:
-        return bot.db_conn
-    bot.db_conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    bot.db_conn.autocommit = True
-    return bot.db_conn
+    if not hasattr(bot, "_db_conn") or bot._db_conn is None:
+        bot._db_conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        bot._db_conn.autocommit = True
+    return bot._db_conn
 
 def ensure_tables():
     """
@@ -105,11 +97,10 @@ def value_indicator(edge_percent: float) -> str:
     return "🟢 Value Bet" if (edge_percent or 0) >= 2.0 else "🔴 Low Value"
 
 def sport_icon(sport: str) -> str:
-    # keep existing mapping minimal
     s = (sport or "").lower()
-    if "soccer" in s or "football" in s and "american" not in s:
+    if "soccer" in s or ("football" in s and "american" not in s):
         return "⚽"
-    if "american" in s or (s == "nfl"):
+    if "american" in s or s == "nfl":
         return "🏈"
     if "basketball" in s or "nba" in s or "nbl" in s:
         return "🏀"
@@ -124,13 +115,6 @@ def sport_icon(sport: str) -> str:
     return "🎲"
 
 def embed_bet_card(b: dict, title: str, color: int) -> discord.Embed:
-    """
-    b must contain:
-      match, team, bookmaker, odds, consensus, probability (implied), edge, time,
-      sport, league, cons_stake_units, sm_stake_units, agg_stake_units,
-      cons_payout_units, sm_payout_units, agg_payout_units,
-      cons_exp_profit_units, sm_exp_profit_units, agg_exp_profit_units
-    """
     league = b.get("league") or "Unknown League"
     sport = b.get("sport") or "Unknown"
     sport_line = f"{sport_icon(sport)} {sport.title()} ({league})"
@@ -163,7 +147,6 @@ def embed_bet_card(b: dict, title: str, color: int) -> discord.Embed:
 class ViewButtons(discord.ui.View):
     def __init__(self, bet_payload: dict, timeout: float = 1800):
         super().__init__(timeout=timeout)
-        # keep only minimum needed to capture
         self.bet_payload = bet_payload
 
     async def _save_user_bet(self, interaction: discord.Interaction, stake_type: str, units: float):
@@ -176,7 +159,7 @@ class ViewButtons(discord.ui.View):
                 cur.execute("""
                     INSERT INTO user_bets (user_id, username, bet_key, event_id, sport, league, match,
                                             bookmaker, team, odds, stake_type, stake_units)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id;
                 """, (
                     str(interaction.user.id),
@@ -194,7 +177,8 @@ class ViewButtons(discord.ui.View):
                 ))
                 row = cur.fetchone()
             await interaction.response.send_message(
-                f"✅ Saved your **{stake_type}** bet ({units:.2f} units). Entry **#{row['id']}**.", ephemeral=True
+                f"✅ Saved your **{stake_type}** bet ({units:.2f} units). Entry **#{row['id']}**.",
+                ephemeral=True
             )
         except Exception as e:
             await interaction.response.send_message(f"❌ Could not save your bet. `{e}`", ephemeral=True)
@@ -352,10 +336,8 @@ async def stats_cmd(interaction: discord.Interaction):
 # ==================================
 # (OPTIONAL) TEST POST COMMAND ONLY
 # ==================================
-# This is just for manual posting of a sample bet with buttons if you want to test.
 @bot.tree.command(name="posttest", description="Post a sample bet card (for quick testing).")
 async def posttest(interaction: discord.Interaction):
-    # minimal sample payload; your live posting will build this dict from your engine
     sample = {
         "bet_key": "SAMPLE-123",
         "event_id": "E-123",
@@ -369,7 +351,6 @@ async def posttest(interaction: discord.Interaction):
         "probability": 50.25,
         "edge": 3.49,
         "time": datetime.now(timezone.utc).strftime("%d/%m/%y %H:%M"),
-        # units-based stakes and outputs (units only)
         "cons_stake_units": 15.0,
         "sm_stake_units": 5.0,
         "agg_stake_units": 66.0,
@@ -401,6 +382,5 @@ if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN env var")
 
 bot.run(TOKEN)
-
 
 
