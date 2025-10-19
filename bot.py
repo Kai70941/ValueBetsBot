@@ -25,7 +25,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 CH_BEST  = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0") or "0")
 CH_QUICK = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0") or "0")
 CH_LONG  = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0") or "0")
-CH_VALUE = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0") or "0")  # duplicate value stream
+CH_VALUE = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0") or "0")  # duplicate stream for value bets
 
 DATABASE_URL = os.getenv("DATABASE_PUBLIC_URL", "").strip()
 
@@ -60,8 +60,11 @@ posted_keys = set()
 DB_OK = bool(DATABASE_URL)
 
 def _connect():
-    # Railway public URL works with sslmode=require
-    return psycopg2.connect(DATABASE_URL, sslmode="require", cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
 
 def _migrate():
     if not DB_OK:
@@ -183,6 +186,21 @@ def save_user_bet(user: discord.User | discord.Member, bet: dict, strategy: str,
         log.exception("Failed to save user bet")
         return False
 
+def fetch_bet_row(bet_key: str):
+    if not DB_OK:
+        return None
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bets WHERE bet_key=%s LIMIT 1;", (bet_key,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row
+    except Exception:
+        log.exception("fetch_bet_row failed")
+        return None
+
 # ----------------------------
 # Sports emojis + league naming
 # ----------------------------
@@ -206,7 +224,6 @@ SPORT_EMOJI = {
 def sport_label_and_emoji(sport_key: str, league: str | None) -> str:
     key = (sport_key or "").lower()
     emoji = SPORT_EMOJI.get(key, "🎲")
-    # “Soccer” instead of “Football” for that sport
     if key in ("soccer",):
         sport_name = "Soccer"
     elif key == "americanfootball":
@@ -225,6 +242,20 @@ def _allowed_bookmaker(title: str) -> bool:
 
 def bet_key_from(event_id: str, book: str, market_key: str, outcome_name: str) -> str:
     return f"{event_id}|{book}|{market_key}|{outcome_name}".lower()
+
+# recompute stakes/exp-profit from saved row
+def compute_units_and_profit(edge: float, odds: float):
+    cons_units = CONSERVATIVE_UNITS
+    kelly_frac = max(0.0, min((edge or 0) / 100.0, 0.10))
+    smart_units = round(cons_units * (1.0 + 2.0 * kelly_frac), 2)
+    aggr_units  = round(cons_units * (1.0 + 5.0 * kelly_frac), 2)
+    p = max(0.0, min(1.0, (edge or 0) / 100.0 + 0.5))  # rough; we’ll prefer consensus elsewhere
+    # Better: derive from consensus if present (we will when called from the button handler)
+    return cons_units, smart_units, aggr_units
+
+def exp_profit(units: float, odds: float, consensus_pct: float):
+    p = max(0.0, min(1.0, (consensus_pct or 0) / 100.0))
+    return round(p * (units * (odds - 1.0)) - (1 - p) * units, 2)
 
 # ----------------------------
 # Odds fetching + calculations
@@ -309,24 +340,18 @@ def calculate_bets(raw):
                         cons = 100.0 * global_cons
 
                     edge = cons - implied
-                    if edge <= 0:
-                        # not value; still could be posted as best/other if you want; we skip non-value
-                        pass
-
                     # class
                     delta = commence - now
                     is_quick = delta <= timedelta(hours=48)
-                    is_long = not is_quick
                     category = "quick" if is_quick else "long"
 
                     # stakes (units)
                     cons_units = CONSERVATIVE_UNITS
-                    # Smart uses Kelly-ish scale on edge (bounded)
                     kelly_frac = max(0.0, min(edge / 100.0, 0.10))  # cap at 10% of cons stake
                     smart_units = round(cons_units * (1.0 + 2.0 * kelly_frac), 2)
                     aggr_units  = round(cons_units * (1.0 + 5.0 * kelly_frac), 2)
 
-                    # expected profit = p * (units * (odds-1)) - (1-p)*units
+                    # expected profit (with consensus as win prob)
                     p = cons / 100.0
                     cons_exp = round(p * (cons_units * (price - 1.0)) - (1 - p) * cons_units, 2)
                     smart_exp = round(p * (smart_units * (price - 1.0)) - (1 - p) * smart_units, 2)
@@ -359,57 +384,27 @@ def calculate_bets(raw):
     return bets
 
 # ----------------------------
-# Embeds + Buttons
+# Embeds + Button View (ID-routed)
 # ----------------------------
-class BetButtons(discord.ui.View):
-    def __init__(self, bet: dict):
-        super().__init__(timeout=None)
-        self.bet = bet
-
-    @discord.ui.button(label="Conservative", style=discord.ButtonStyle.secondary, emoji="💵")
-    async def conservative(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ok = save_user_bet(
-            interaction.user, self.bet, "conservative",
-            self.bet["cons_units"], self.bet["odds"], self.bet["cons_exp"]
-        )
-        if ok:
-            await interaction.response.send_message(
-                f"Saved **Conservative** bet: {self.bet['match']} | {self.bet['team']} | {self.bet['cons_units']} units",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("❌ Could not save your bet. Is the database configured?", ephemeral=True)
-
-    @discord.ui.button(label="Smart", style=discord.ButtonStyle.primary, emoji="🧠")
-    async def smart(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ok = save_user_bet(
-            interaction.user, self.bet, "smart",
-            self.bet["smart_units"], self.bet["odds"], self.bet["smart_exp"]
-        )
-        if ok:
-            await interaction.response.send_message(
-                f"Saved **Smart** bet: {self.bet['match']} | {self.bet['team']} | {self.bet['smart_units']} units",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("❌ Could not save your bet. Is the database configured?", ephemeral=True)
-
-    @discord.ui.button(label="Aggressive", style=discord.ButtonStyle.danger, emoji="🔥")
-    async def aggressive(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ok = save_user_bet(
-            interaction.user, self.bet, "aggressive",
-            self.bet["aggr_units"], self.bet["odds"], self.bet["aggr_exp"]
-        )
-        if ok:
-            await interaction.response.send_message(
-                f"Saved **Aggressive** bet: {self.bet['match']} | {self.bet['team']} | {self.bet['aggr_units']} units",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("❌ Could not save your bet. Is the database configured?", ephemeral=True)
+def build_bet_view(bet: dict) -> discord.ui.View:
+    """Return a view whose buttons carry custom_ids so we can handle them in on_interaction."""
+    view = discord.ui.View(timeout=None)
+    # custom_id schema: place|<bet_key>|<strategy>
+    view.add_item(discord.ui.Button(
+        label="Conservative", emoji="💵", style=discord.ButtonStyle.secondary,
+        custom_id=f"place|{bet['bet_key']}|conservative"
+    ))
+    view.add_item(discord.ui.Button(
+        label="Smart", emoji="🧠", style=discord.ButtonStyle.primary,
+        custom_id=f"place|{bet['bet_key']}|smart"
+    ))
+    view.add_item(discord.ui.Button(
+        label="Aggressive", emoji="🔥", style=discord.ButtonStyle.danger,
+        custom_id=f"place|{bet['bet_key']}|aggressive"
+    ))
+    return view
 
 def embed_for_bet(title: str, bet: dict, color: int):
-    # Value badge
     indicator = "🟢 Value Bet" if bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD else "🔴 Low Value"
     sport_line = sport_label_and_emoji(bet.get("sport"), bet.get("league"))
 
@@ -433,24 +428,18 @@ def embed_for_bet(title: str, bet: dict, color: int):
 # Posting logic
 # ----------------------------
 async def post_bet_to_channels(bet: dict):
-    # Decide title & color by category or "best"
     title = "Quick Return Bet" if bet["category"] == "quick" else "Longer Play Bet"
     color = 0x2ecc71 if bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD else 0xe74c3c
-
-    # "Best Bet": we pick best separately outside
     if bet.get("_is_best"):
         title = "Best Bet"
         color = 0xf1c40f
 
-    # embed + buttons
-    emb = embed_for_bet(title, bet, color)
-    view = BetButtons(bet)
+    emb  = embed_for_bet(title, bet, color)
+    view = build_bet_view(bet)
 
-    # main destination
     ch_id = CH_QUICK if bet["category"] == "quick" else CH_LONG
     if bet.get("_is_best"):
         ch_id = CH_BEST
-
     channel = bot.get_channel(ch_id) if ch_id else None
     if channel:
         try:
@@ -458,7 +447,6 @@ async def post_bet_to_channels(bet: dict):
         except Exception:
             log.exception("Failed to send embed")
 
-    # duplicate value bets to value channel (testing)
     if bet.get("edge", 0) >= VALUE_EDGE_THRESHOLD and CH_VALUE:
         vch = bot.get_channel(CH_VALUE)
         if vch:
@@ -468,21 +456,21 @@ async def post_bet_to_channels(bet: dict):
             except Exception:
                 log.exception("Failed to duplicate to value channel")
 
-    # persist feed bet (once)
     save_bet_row(bet)
 
 async def post_pack(bets: list[dict]):
     if not bets:
         return
-    # pick a best bet — highest edge & reasonable consensus (>=50)
-    best = max(bets, key=lambda b: (b.get("edge", 0), b.get("consensus", 0)))
-    if best and best.get("edge", 0) >= VALUE_EDGE_THRESHOLD and best.get("consensus", 0) >= 50:
-        best["_is_best"] = True
+    # select a genuinely strong best bet
+    candidates = [b for b in bets if b.get("edge", 0) >= VALUE_EDGE_THRESHOLD and b.get("consensus", 0) >= 50]
+    if candidates:
+        best = max(candidates, key=lambda b: (b.get("edge", 0), b.get("consensus", 0)))
         if best["bet_key"] not in posted_keys:
+            best["_is_best"] = True
             posted_keys.add(best["bet_key"])
             await post_bet_to_channels(best)
 
-    # remaining
+    # rest
     for b in bets:
         if b.get("_is_best"):
             continue
@@ -490,6 +478,68 @@ async def post_pack(bets: list[dict]):
             continue
         posted_keys.add(b["bet_key"])
         await post_bet_to_channels(b)
+
+# ----------------------------
+# Button handler (survives restarts)
+# ----------------------------
+@bot.listen("on_interaction")
+async def handle_place_buttons(inter: discord.Interaction):
+    """Handle clicks on our custom-id buttons: place|<bet_key>|<strategy>"""
+    try:
+        if inter.type != discord.InteractionType.component:
+            return
+        cid = inter.data.get("custom_id", "")
+        if not cid.startswith("place|"):
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            _, bet_key, strategy = cid.split("|", 2)
+        except ValueError:
+            await inter.followup.send("Invalid button payload.", ephemeral=True)
+            return
+
+        row = fetch_bet_row(bet_key)
+        if not row:
+            await inter.followup.send("Sorry, I couldn't find this bet in the database.", ephemeral=True)
+            return
+
+        # Recompute stakes using stored edge/odds and expected profit using stored consensus
+        edge = float(row.get("edge") or 0.0)
+        odds = float(row.get("odds") or 0.0)
+        consensus = float(row.get("consensus") or 50.0)
+
+        cons_units, smart_units, aggr_units = compute_units_and_profit(edge, odds)
+        if strategy == "conservative":
+            units = cons_units
+        elif strategy == "smart":
+            units = smart_units
+        else:
+            strategy = "aggressive"
+            units = aggr_units
+
+        ep = exp_profit(units, odds, consensus)
+
+        bet_payload = {
+            "bet_key": row["bet_key"],
+            "event_id": None,
+            "sport": row.get("sport"),
+            "league": row.get("league"),
+        }
+
+        ok = save_user_bet(inter.user, bet_payload, strategy, units, odds, ep)
+        if ok:
+            await inter.followup.send(
+                f"Saved **{strategy.capitalize()}** bet for **{row['match']}** — {row['team']} | {units:.2f} units",
+                ephemeral=True
+            )
+        else:
+            await inter.followup.send("❌ Could not save your bet. Is the database configured?", ephemeral=True)
+
+    except Exception:
+        log.exception("handle_place_buttons error")
+        # If we get here and haven't responded, Discord shows a generic error; we already deferred above.
 
 # ----------------------------
 # Scheduler
@@ -618,8 +668,6 @@ if not TOKEN:
 if not ODDS_API_KEY:
     log.warning("No ODDS_API_KEY – bot will run but won't fetch odds.")
 bot.run(TOKEN)
-
-
 
 
 
