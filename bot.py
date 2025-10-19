@@ -242,7 +242,7 @@ def fetch_odds():
         logging.error(f"Odds API error: {e}")
         return []
 
-def fetch_scores_for_sport(sport_key: str, days_from: int = 3):
+def fetch_scores_for_sport(sport_key: str, days_from: int = 7):
     """Return list of score objects for a sport over recent days."""
     params = {
         "apiKey": ODDS_API_KEY,
@@ -487,19 +487,21 @@ async def duplicate_to_value_channel(b: dict, embed: discord.Embed):
     posted_by_channel["value"].add(k)
 
 # =======================
-# Posting flow
+# Posting flow (Best = value only ✅)
 # =======================
 async def post_bets(bets):
     if not bets:
         return
 
-    best = max(bets, key=lambda x: (x["consensus"], x["edge"])) if bets else None
+    # ✅ Only allow VALUE bets to compete for Best Bet
+    value_candidates = [b for b in bets if b.get("is_value")]
+    best = max(value_candidates, key=lambda x: (x["consensus"], x["edge"])) if value_candidates else None
 
     bchan = bot.get_channel(BEST_BETS_CHANNEL) if BEST_BETS_CHANNEL else None
     qchan = bot.get_channel(QUICK_RETURNS_CHANNEL) if QUICK_RETURNS_CHANNEL else None
     lchan = bot.get_channel(LONG_PLAYS_CHANNEL) if LONG_PLAYS_CHANNEL else None
 
-    # Best
+    # ⭐ Best (value-only)
     if best and bchan:
         k = bet_identity(best)
         if k not in posted_by_channel["best"]:
@@ -509,7 +511,7 @@ async def post_bets(bets):
             save_bet_to_db(best, "best")
         await duplicate_to_value_channel(best, format_bet(best, "🟢 Value Bet (Testing)", 0x2ECC71))
 
-    # Quick
+    # ⏱ Quick
     quick = [b for b in bets if b["quick_return"]]
     if qchan:
         for b in quick[:5]:
@@ -522,7 +524,7 @@ async def post_bets(bets):
             save_bet_to_db(b, "quick")
             await duplicate_to_value_channel(b, format_bet(b, "🟢 Value Bet (Testing)", 0x2ECC71))
 
-    # Long
+    # 📅 Long
     long_plays = [b for b in bets if b["long_play"]]
     if lchan:
         for b in long_plays[:5]:
@@ -540,7 +542,6 @@ async def post_bets(bets):
 # =======================
 def decide_result(user_pick_team: str, home_team: str, away_team: str, home_score: float, away_score: float):
     """Return 'win' | 'loss' | 'push' given team scores for H2H bets."""
-    # Basic H2H logic; totals/spreads not handled here
     if home_score == away_score:
         return "push"
     winner = home_team if home_score > away_score else away_team
@@ -554,7 +555,6 @@ async def settler_loop():
     if not (DB_URL and psycopg2 and ODDS_API_KEY):
         return
     try:
-        # Pull all unsettled bets whose scheduled start is likely passed (buffer -1h)
         with psycopg2.connect(DB_URL, cursor_factory=RealDictCursor) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -573,17 +573,14 @@ async def settler_loop():
         if not pending:
             return
 
-        # Group by sport_key to minimize API calls
         by_sport = defaultdict(list)
         for row in pending:
             by_sport[row["sport_key"]].append(row)
 
         for sport_key, rows in by_sport.items():
             scores = fetch_scores_for_sport(sport_key, days_from=7) or []
-            # Map by event_id for quick lookup
             by_event = {s.get("id"): s for s in scores if s.get("completed")}
 
-            # Apply settlements
             with psycopg2.connect(DB_URL) as conn:
                 with conn.cursor() as cur:
                     for r in rows:
@@ -592,11 +589,11 @@ async def settler_loop():
                             continue
                         home_team = sc.get("home_team") or ""
                         away_team = sc.get("away_team") or ""
+                        # Scores shape differs by sport; try both schema styles
                         try:
                             home_score = float(sc.get("scores", [{}])[0].get("score", 0))
                             away_score = float(sc.get("scores", [{}])[1].get("score", 0))
                         except Exception:
-                            # Some sports return scores differently; also try alt fields
                             home_score = float(sc.get("home_score") or 0)
                             away_score = float(sc.get("away_score") or 0)
 
