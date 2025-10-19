@@ -548,7 +548,7 @@ async def stats_cmd(interaction: discord.Interaction):
 # BACKGROUND LOOP
 # =========================
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=5)
 async def bet_loop():
     data = await fetch_odds()
     bets = calc_bets_from_odds(data)
