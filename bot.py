@@ -139,6 +139,7 @@ def ensure_schema():
           pnl_units NUMERIC
         );
     """)
+
     # add missing columns defensively (safe to run repeatedly)
     for (table, col, typ) in [
         ("user_bets", "stake_type", "TEXT"),
@@ -146,6 +147,12 @@ def ensure_schema():
         ("user_bets", "result", "TEXT"),
         ("user_bets", "settled_at", "TIMESTAMPTZ"),
         ("user_bets", "league", "TEXT"),
+
+        # NEW: needed for settlement of spreads/totals too
+        ("bets", "market", "TEXT"),
+        ("bets", "point", "NUMERIC"),
+        ("user_bets", "market", "TEXT"),
+        ("user_bets", "point", "NUMERIC"),
     ]:
         cur.execute(f"""
           DO $$
@@ -170,9 +177,9 @@ def save_bet_row(bet: dict):
     cur = conn.cursor()
     cur.execute("""
       INSERT INTO bets (event_id, bet_key, match, bookmaker, team, odds, edge, bet_time,
-                        category, sport, league)
+                        category, sport, league, market, point)
       VALUES (%(event_id)s, %(bet_key)s, %(match)s, %(bookmaker)s, %(team)s, %(odds)s,
-              %(edge)s, %(bet_time)s, %(category)s, %(sport)s, %(league)s)
+              %(edge)s, %(bet_time)s, %(category)s, %(sport)s, %(league)s, %(market)s, %(point)s)
       ON CONFLICT (bet_key) DO NOTHING;
     """, bet)
     conn.commit()
@@ -187,12 +194,13 @@ def save_user_bet(user: discord.User | discord.Member, bet: dict, stake_type: st
     cur = conn.cursor()
     cur.execute("""
       INSERT INTO user_bets
-        (user_id, username, bet_key, event_id, sport, league, stake_type, stake_units, odds)
-      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (user_id, username, bet_key, event_id, sport, league, stake_type, stake_units, odds, market, point)
+      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
       RETURNING id;
     """, (
         int(user.id), str(user.name), bet["bet_key"], bet.get("event_id"),
-        bet.get("sport"), bet.get("league"), stake_type, stake_units, bet.get("odds")
+        bet.get("sport"), bet.get("league"), stake_type, stake_units, bet.get("odds"),
+        bet.get("market"), bet.get("point")
     ))
     row_id = cur.fetchone()["id"]
     conn.commit()
@@ -238,6 +246,52 @@ def db_agg_user(user_id: int) -> dict:
     cur.close(); conn.close()
     return row
 
+def db_get_unsettled(limit: int = 500) -> list[dict]:
+    """Fetch unsettled user bets, enriched with bet details when available."""
+    if not DATABASE_URL:
+        return []
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT
+        ub.id as user_bet_id,
+        ub.user_id,
+        ub.bet_key,
+        ub.event_id,
+        ub.sport,
+        ub.stake_units,
+        ub.odds,
+        COALESCE(ub.market, b.market) as market,
+        COALESCE(ub.point, b.point) as point,
+        COALESCE(b.team, '') as team,
+        COALESCE(b.match, '') as match,
+        COALESCE(b.bet_time, ub.placed_at) as bet_time
+      FROM user_bets ub
+      LEFT JOIN bets b ON b.bet_key = ub.bet_key
+      WHERE ub.result IS NULL
+      ORDER BY ub.placed_at ASC
+      LIMIT %s;
+    """, (limit,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def db_settle_user_bet(user_bet_id: int, result: str, pnl_units: float):
+    if not DATABASE_URL:
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+      UPDATE user_bets
+      SET result = %s,
+          pnl_units = %s,
+          settled_at = NOW()
+      WHERE id = %s
+        AND result IS NULL;
+    """, (result, pnl_units, user_bet_id))
+    conn.commit()
+    cur.close(); conn.close()
+
 # ------------- ODDS FETCH (TheOddsAPI) -------------
 def allowed_book(title: str) -> bool:
     return any(k in (title or "").lower() for k in BOOKMAKER_WHITELIST)
@@ -258,6 +312,127 @@ def theodds_fetch_upcoming():
         return r.json()
     except Exception:
         return []
+
+def theodds_fetch_scores(sport_key: str, days_from: int = 7):
+    """Fetch completed scores for a sport to settle bets."""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/"
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "daysFrom": days_from,
+        "dateFormat": "iso",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return []
+        return r.json()
+    except Exception:
+        return []
+
+def _parse_score_value(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _event_scores_map(scores_payload: list[dict]) -> dict:
+    """
+    Build map: event_id -> dict with home, away, home_score, away_score, completed
+    TheOddsAPI scores payload usually includes: id, home_team, away_team, completed, scores:[{name,score},...]
+    """
+    out = {}
+    for ev in scores_payload or []:
+        eid = ev.get("id")
+        if not eid:
+            continue
+        completed = bool(ev.get("completed"))
+        home = ev.get("home_team") or ""
+        away = ev.get("away_team") or ""
+        hs = None
+        as_ = None
+
+        scores = ev.get("scores") or []
+        if isinstance(scores, list):
+            for s in scores:
+                nm = (s.get("name") or "").strip()
+                sc = _parse_score_value(s.get("score"))
+                if not nm:
+                    continue
+                if nm == home:
+                    hs = sc
+                elif nm == away:
+                    as_ = sc
+
+        out[eid] = {
+            "completed": completed,
+            "home_team": home,
+            "away_team": away,
+            "home_score": hs,
+            "away_score": as_,
+        }
+    return out
+
+def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, home_score: float, away_score: float):
+    """
+    Returns: 'win'|'loss'|'void'|None
+    Supports: h2h, totals, spreads
+    """
+    market = (market or "").lower()
+    team_norm = (team or "").strip().lower()
+
+    if home_score is None or away_score is None:
+        return None
+
+    # H2H
+    if market == "h2h":
+        if home_score == away_score:
+            return "void"
+        winner = home_team if home_score > away_score else away_team
+        return "win" if team.strip().lower() == winner.strip().lower() else "loss"
+
+    # TOTALS
+    if market == "totals":
+        if point is None:
+            return None
+        try:
+            line = float(point)
+        except Exception:
+            return None
+        total = home_score + away_score
+        if abs(total - line) < 1e-9:
+            return "void"
+        if team_norm == "over":
+            return "win" if total > line else "loss"
+        if team_norm == "under":
+            return "win" if total < line else "loss"
+        return None
+
+    # SPREADS
+    if market == "spreads":
+        if point is None:
+            return None
+        try:
+            spread = float(point)
+        except Exception:
+            return None
+
+        # outcome name is usually the team; apply spread to that team's score
+        if team.strip().lower() == home_team.strip().lower():
+            adj = home_score + spread
+            if abs(adj - away_score) < 1e-9:
+                return "void"
+            return "win" if adj > away_score else "loss"
+
+        if team.strip().lower() == away_team.strip().lower():
+            adj = away_score + spread
+            if abs(adj - home_score) < 1e-9:
+                return "void"
+            return "win" if adj > home_score else "loss"
+
+        return None
+
+    # Unknown market
+    return None
 
 def compute_bets_from_payload(payload):
     """Very similar to what you had — compute bets & classifications."""
@@ -303,16 +478,18 @@ def compute_bets_from_payload(payload):
             if not allowed_book(bk.get("title", "")):
                 continue
             for m in bk.get("markets", []):
+                mk = m.get("key") or ""
                 for oc in m.get("outcomes", []):
                     nm = oc.get("name"); pr = oc.get("price")
                     if not nm or not pr:
                         continue
                     implied = 1/float(pr)
-                    keyo = f"{m['key']}:{nm}"
+                    keyo = f"{mk}:{nm}"
                     consensus = (sum(cs_map[keyo])/len(cs_map[keyo])) if keyo in cs_map else global_c
                     edge = (consensus - implied) * 100.0
                     if edge <= 0:
                         continue
+
                     # classification
                     delta = dt - now
                     quick = (delta <= timedelta(hours=48))
@@ -324,7 +501,7 @@ def compute_bets_from_payload(payload):
                     smart_units = round(conservative_units * max(1.0, (consensus*100)/50.0), 2)
                     aggressive_units = round(conservative_units * (1 + (edge/10.0)), 2)
 
-                    bet_key = f"{match_name}|{nm}|{bk['title']}|{dt.isoformat()}"
+                    bet_key = f"{match_name}|{mk}|{nm}|{bk['title']}|{dt.isoformat()}"
 
                     bet = {
                         "event_id": ev.get("id") or bet_key,
@@ -345,7 +522,11 @@ def compute_bets_from_payload(payload):
                         "emoji": sport_emoji,
                         "conservative_units": conservative_units,
                         "smart_units": smart_units,
-                        "aggressive_units": aggressive_units
+                        "aggressive_units": aggressive_units,
+
+                        # NEW: settlement fields
+                        "market": mk,
+                        "point": oc.get("point"),  # for spreads/totals (None for h2h)
                     }
                     results.append(bet)
     return results
@@ -357,12 +538,24 @@ def value_indicator(edge_pct: float) -> str:
 def bet_embed(bet: dict, title: str, color: int) -> Embed:
     ind = value_indicator(bet["edge"])
     sport_line = f"{bet['emoji']} {bet['sport'].title()} ({bet.get('league') or 'Unknown League'})"
+
+    market = (bet.get("market") or "").lower()
+    point = bet.get("point")
+    market_line = ""
+    if market == "totals" and point is not None:
+        market_line = f"\n**Market:** Totals ({bet['team']} {point})"
+    elif market == "spreads" and point is not None:
+        market_line = f"\n**Market:** Spreads ({bet['team']} {point:+})"
+    elif market:
+        market_line = f"\n**Market:** {market.upper()}"
+
     desc = (
         f"{ind}\n\n"
         f"**{sport_line}**\n\n"
         f"**Match:** {bet['match']}\n"
         f"**Pick:** {bet['team']} @ {bet['odds']}\n"
-        f"**Bookmaker:** {bet['bookmaker']}\n"
+        f"**Bookmaker:** {bet['bookmaker']}"
+        f"{market_line}\n"
         f"**Consensus %:** {bet['consensus']}%\n"
         f"**Implied %:** {round((1/bet['odds'])*100,2)}%\n"
         f"**Edge:** {bet['edge']}%\n"
@@ -424,7 +617,6 @@ intents.message_content = True
 
 class ValueBetsBot(commands.Bot):
     def __init__(self):
-        # DO NOT create a CommandTree yourself; Bot already has one.
         super().__init__(command_prefix="!", intents=intents)
         self.synced = False
 
@@ -458,7 +650,6 @@ async def fetchbets_cmd(interaction: Interaction):
         await interaction.followup.send("No value bets found right now.", ephemeral=True)
         return
 
-    # Show the first 3 as preview only
     lines = []
     for b in bets[:3]:
         lines.append(f"**{b['match']}** · {b['team']} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%")
@@ -477,7 +668,8 @@ async def roi_cmd(interaction: Interaction):
            f"- Staked: {staked:.2f} units\n"
            f"- P/L: {pnl:.2f} units\n"
            f"- ROI: {roi:.2f}%\n"
-           f"- Win rate (settled): {wr:.2f}%")
+           f"- Win rate (settled): {wr:.2f}%\n"
+           f"- Settled bets: {agg['settled']}")
     await interaction.response.send_message(msg, ephemeral=True)
 
 # -------- /stats (personal) ----
@@ -493,63 +685,121 @@ async def stats_cmd(interaction: Interaction):
            f"- Staked: {staked:.2f} units\n"
            f"- P/L: {pnl:.2f} units\n"
            f"- ROI: {roi:.2f}%\n"
-           f"- Win rate (settled): {wr:.2f}%")
+           f"- Win rate (settled): {wr:.2f}%\n"
+           f"- Settled bets: {agg['settled']}")
     await interaction.response.send_message(msg, ephemeral=True)
 
 # ------------- Posting helpers (used by your loop or elsewhere) -------------
 async def post_bet_to_channels(bet: dict):
-    """Posts a single bet embed with buttons; duplicates to VALUE_DUP_CHANNEL if configured."""
-    # Decide destination by category
+    """Posts a single bet embed with buttons; duplicates to app-specific channel; duplicates to VALUE_DUP_CHANNEL if configured."""
     channel_id = BEST_BETS_CHANNEL
     title = "⭐ Best Bet"
     color = Color.gold().value
 
-    # best pick = combine probability & edge; you can customize outside
     if bet.get("quick_return"):
         channel_id = QUICK_RETURNS_CHANNEL
         title = "⏱ Quick Return Bet"
-        color = 0x2ECC71  # green
+        color = 0x2ECC71
     elif bet.get("long_play"):
         channel_id = LONG_PLAYS_CHANNEL
         title = "📅 Longer Play Bet"
-        color = 0x3498DB  # blue
+        color = 0x3498DB
 
     e = bet_embed(bet, title, color)
     view = StakeButtons(bet["bet_key"])
 
-    # index this bet for button callbacks
     POSTED_BETS[bet["bet_key"]] = bet
-    # persist in bets table for auditing/paper feed
+
     try:
         save_bet_row(bet)
     except Exception:
         pass
 
-    # main channel
     if channel_id:
         ch = bot.get_channel(channel_id)
         if ch:
             await ch.send(embed=e, view=view)
 
-    # duplicate to the appropriate bookmaker channel (your requested change)
+    # duplicate to the appropriate bookmaker channel
     try:
         bm_key = _normalize_bookmaker(bet.get("bookmaker", ""))
         bm_channel_id = BOOKMAKER_CHANNEL_IDS.get(bm_key)
         if bm_channel_id:
             bm_ch = bot.get_channel(int(bm_channel_id))
             if bm_ch:
-                # use a fresh View instance for this message
                 await bm_ch.send(embed=e, view=StakeButtons(bet["bet_key"]))
     except Exception:
         pass
 
-    # duplicate Value channel (testing)
     if VALUE_DUP_CHANNEL:
         ch2 = bot.get_channel(VALUE_DUP_CHANNEL)
         if ch2:
-            # title override for test channel
             e2 = bet_embed(bet, "⭐ Value Bet (Testing)", Color.green().value)
             await ch2.send(embed=e2, view=StakeButtons(bet["bet_key"]))
+
+# ------------- Settlement loop -------------
+@tasks.loop(minutes=10)
+async def settle_loop():
+    if not ODDS_API_KEY or not DATABASE_URL:
+        return
+
+    unsettled = db_get_unsettled(limit=500)
+    if not unsettled:
+        return
+
+    # group by sport to minimize API calls
+    by_sport = defaultdict(list)
+    for row in unsettled:
+        sport_key = (row.get("sport") or "").lower()
+        # only attempt settlement after start time
+        bt = row.get("bet_time")
+        if isinstance(bt, datetime):
+            if bt.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+                continue
+        if sport_key:
+            by_sport[sport_key].append(row)
+
+    for sport_key, rows in by_sport.items():
+        scores_payload = theodds_fetch_scores(sport_key, days_from=7)
+        smap = _event_scores_map(scores_payload)
+
+        for r in rows:
+            eid = r.get("event_id")
+            if not eid or eid not in smap:
+                continue
+
+            ev = smap[eid]
+            if not ev.get("completed"):
+                continue
+
+            hs = ev.get("home_score")
+            aw = ev.get("away_score")
+            if hs is None or aw is None:
+                continue
+
+            market = (r.get("market") or "").lower()
+            team = r.get("team") or ""
+            point = r.get("point")
+
+            result = _settle_calc(market, team, point, ev["home_team"], ev["away_team"], hs, aw)
+            if result is None:
+                # can't determine; skip for now
+                continue
+
+            stake = float(r.get("stake_units") or 0.0)
+            odds = float(r.get("odds") or 0.0)
+
+            if result == "win":
+                pnl = stake * (odds - 1.0)
+            elif result == "loss":
+                pnl = -stake
+            else:  # void
+                pnl = 0.0
+
+            try:
+                db_settle_user_bet(int(r["user_bet_id"]), result, float(round(pnl, 4)))
+            except Exception:
+                continue
 
 # ------------- Example background loop (optional) -------------
 @tasks.loop(minutes=5)
@@ -563,7 +813,6 @@ async def bet_loop():
     if not bets:
         return
 
-    # pick a few best (example: top by edge)
     bets.sort(key=lambda x: (x["edge"], x["consensus"]), reverse=True)
     for b in bets[:5]:
         try:
@@ -574,16 +823,16 @@ async def bet_loop():
 
 @bot.event
 async def on_connect():
-    # start loop if not running
     if not bet_loop.is_running():
         bet_loop.start()
+    if not settle_loop.is_running():
+        settle_loop.start()
 
 # ------------- RUN -------------
 if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN")
 
 bot.run(TOKEN)
-
 
 
 
