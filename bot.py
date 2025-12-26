@@ -35,8 +35,13 @@ BANKROLL_UNITS = 1000.0                  # “units” bankroll notion (not curr
 CONSERVATIVE_PCT = 0.015                 # 1.5% conservative
 VALUE_EDGE_THRESHOLD = 2.0               # remove all "low value" bets (< 2% edge)
 
+# Daily Picks channel (hard-coded)
+DAILY_PICKS_CHANNEL_ID = 1454041180336554116
+
+# Perth timezone for scheduling (UTC+08)
+PERTH_TZ = timezone(timedelta(hours=8))
+
 BOOKMAKER_WHITELIST = {
-    # Your 9 AU/UK books
     "sportsbet", "bet365", "ladbrokes", "tabtouch", "neds",
     "pointsbet", "dabble", "betfair", "tab"
 }
@@ -87,8 +92,10 @@ SPORT_EMOJI = {
 }
 
 # In-memory index of posted bets so our buttons know what to save
-# bet_key -> bet dict
 POSTED_BETS: dict[str, dict] = {}
+
+# In-memory guard so Daily Picks only posts once per day (Perth date)
+_LAST_DAILY_PICKS_DATE: str | None = None
 
 # ------------- DB HELPERS -------------
 def get_db_conn():
@@ -103,7 +110,6 @@ def ensure_schema():
     conn = get_db_conn()
     conn.autocommit = True
     cur = conn.cursor()
-    # bets table (for paper feed / auditing)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bets (
           id SERIAL PRIMARY KEY,
@@ -121,7 +127,6 @@ def ensure_schema():
           created_at TIMESTAMPTZ DEFAULT NOW()
         );
     """)
-    # user_bets table (button clicks by real users)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_bets (
           id SERIAL PRIMARY KEY,
@@ -131,26 +136,22 @@ def ensure_schema():
           event_id TEXT,
           sport TEXT,
           league TEXT,
-          stake_type TEXT,       -- 'conservative'|'smart'|'aggressive'
+          stake_type TEXT,
           stake_units NUMERIC,
           odds NUMERIC,
           placed_at TIMESTAMPTZ DEFAULT NOW(),
-          -- paper-trading settlement:
-          result TEXT,           -- 'win'|'loss'|'void'|NULL
+          result TEXT,
           settled_at TIMESTAMPTZ,
           pnl_units NUMERIC
         );
     """)
 
-    # add missing columns defensively (safe to run repeatedly)
     for (table, col, typ) in [
         ("user_bets", "stake_type", "TEXT"),
         ("user_bets", "pnl_units", "NUMERIC"),
         ("user_bets", "result", "TEXT"),
         ("user_bets", "settled_at", "TIMESTAMPTZ"),
         ("user_bets", "league", "TEXT"),
-
-        # settlement fields
         ("bets", "market", "TEXT"),
         ("bets", "point", "NUMERIC"),
         ("user_bets", "market", "TEXT"),
@@ -172,7 +173,6 @@ def ensure_schema():
     conn.close()
 
 def save_bet_row(bet: dict):
-    """Insert the bet in bets table (ignore if exists)."""
     if not DATABASE_URL:
         return
     conn = get_db_conn()
@@ -189,7 +189,6 @@ def save_bet_row(bet: dict):
     conn.close()
 
 def save_user_bet(user: discord.User | discord.Member, bet: dict, stake_type: str, stake_units: float) -> int:
-    """Insert a user's placed bet; returns inserted id."""
     if not DATABASE_URL:
         raise RuntimeError("DB not configured")
     conn = get_db_conn()
@@ -211,7 +210,6 @@ def save_user_bet(user: discord.User | discord.Member, bet: dict, stake_type: st
     return row_id
 
 def db_agg_total() -> dict:
-    """System-wide paper-stats from user_bets."""
     if not DATABASE_URL:
         return {"bets": 0, "staked": 0.0, "pnl": 0.0, "wins": 0, "settled": 0}
     conn = get_db_conn()
@@ -249,7 +247,6 @@ def db_agg_user(user_id: int) -> dict:
     return row
 
 def db_get_unsettled(limit: int = 500) -> list[dict]:
-    """Fetch unsettled user bets, enriched with bet details when available."""
     if not DATABASE_URL:
         return []
     conn = get_db_conn()
@@ -299,7 +296,6 @@ def allowed_book(title: str) -> bool:
     return any(k in (title or "").lower() for k in BOOKMAKER_WHITELIST)
 
 def theodds_fetch_upcoming():
-    """Fetch a small sample for /fetchbets on-demand (safe on credits)."""
     url = "https://api.the-odds-api.com/v4/sports/upcoming/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -316,7 +312,6 @@ def theodds_fetch_upcoming():
         return []
 
 def theodds_fetch_scores(sport_key: str, days_from: int = 7):
-    """Fetch completed scores for a sport to settle bets."""
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -475,7 +470,6 @@ def compute_bets_from_payload(payload):
                     consensus = (sum(cs_map[keyo])/len(cs_map[keyo])) if keyo in cs_map else global_c
                     edge = (consensus - implied) * 100.0
 
-                    # ✅ REMOVE ALL LOW VALUE BETS
                     if edge < VALUE_EDGE_THRESHOLD:
                         continue
 
@@ -518,7 +512,6 @@ def compute_bets_from_payload(payload):
 
 # ------------- EMBEDS + BUTTONS -------------
 def value_indicator(edge_pct: float) -> str:
-    # With filtering enabled, this will almost always be value.
     return "🟢 Value Bet"
 
 def bet_embed(bet: dict, title: str, color: int) -> Embed:
@@ -555,6 +548,26 @@ def bet_embed(bet: dict, title: str, color: int) -> Embed:
     )
     e = Embed(title=title, description=desc, color=color)
     e.set_footer(text="Click a stake button below to record your paper-trade.")
+    return e
+
+def daily_picks_embed(bets: list[dict]) -> Embed:
+    now_perth = datetime.now(PERTH_TZ)
+    title = f"📌 Daily Picks — {now_perth.strftime('%d/%m/%Y')}"
+    if not bets:
+        return Embed(title=title, description="No value bets found right now.", color=Color.blurple().value)
+
+    lines = []
+    for i, b in enumerate(bets[:10], start=1):
+        when = b["bet_time"].astimezone(PERTH_TZ).strftime('%d/%m %H:%M')
+        lines.append(
+            f"**{i}.** {b['emoji']} **{b['match']}**\n"
+            f"• Pick: **{b['team']}** @ **{b['odds']}** ({b['bookmaker']})\n"
+            f"• Edge: **{b['edge']}%** • Starts: **{when}**\n"
+        )
+
+    desc = "\n".join(lines)
+    e = Embed(title=title, description=desc, color=Color.blurple().value)
+    e.set_footer(text="Top 10 highest-edge value bets currently available.")
     return e
 
 class StakeButtons(discord.ui.View):
@@ -680,7 +693,6 @@ async def stats_cmd(interaction: Interaction):
 
 # ------------- Posting helpers -------------
 async def post_bet_to_channels(bet: dict):
-    """Posts a single bet embed with buttons; duplicates to app-specific channel; duplicates to VALUE_DUP_CHANNEL if configured."""
     channel_id = BEST_BETS_CHANNEL
     title = "⭐ Best Bet"
     color = Color.gold().value
@@ -704,20 +716,18 @@ async def post_bet_to_channels(bet: dict):
     except Exception:
         pass
 
-    # main channel (Best Bets stays in Best Bets)
     if channel_id:
         ch = bot.get_channel(channel_id)
         if ch:
             await ch.send(embed=e, view=view)
 
-    # ✅ duplicate to the appropriate bookmaker channel (Best Bets will also duplicate)
+    # duplicate to the appropriate bookmaker channel
     try:
         bm_key = _normalize_bookmaker(bet.get("bookmaker", ""))
         bm_channel_id = BOOKMAKER_CHANNEL_IDS.get(bm_key)
         if bm_channel_id:
             bm_ch = bot.get_channel(int(bm_channel_id))
             if bm_ch:
-                # fresh embed + fresh view instance
                 e_bm = bet_embed(bet, title, color)
                 await bm_ch.send(embed=e_bm, view=StakeButtons(bet["bet_key"]))
     except Exception:
@@ -728,6 +738,51 @@ async def post_bet_to_channels(bet: dict):
         if ch2:
             e2 = bet_embed(bet, "⭐ Value Bet (Testing)", Color.green().value)
             await ch2.send(embed=e2, view=StakeButtons(bet["bet_key"]))
+
+# ------------- Daily Picks loop (top 10 by edge, at 12:00pm Perth time daily) -------------
+@tasks.loop(minutes=1)
+async def daily_picks_loop():
+    """
+    Posts once per Perth day at 12:00pm (noon) Perth time.
+    Loop runs every minute, and uses a small window (12:00-12:04) so it still posts if the bot lags/restarts.
+    """
+    global _LAST_DAILY_PICKS_DATE
+
+    if not ODDS_API_KEY:
+        return
+
+    now_perth = datetime.now(PERTH_TZ)
+    today_key = now_perth.strftime("%Y-%m-%d")
+
+    # Only post once per day
+    if _LAST_DAILY_PICKS_DATE == today_key:
+        return
+
+    # Only post at 12:00pm Perth time (allow a small window)
+    if not (now_perth.hour == 12 and 0 <= now_perth.minute <= 4):
+        return
+
+    payload = theodds_fetch_upcoming()
+    if not payload:
+        return
+
+    bets = compute_bets_from_payload(payload)
+    if not bets:
+        return
+
+    bets.sort(key=lambda x: (x["edge"], x["consensus"]), reverse=True)
+    top10 = bets[:10]
+
+    ch = bot.get_channel(int(DAILY_PICKS_CHANNEL_ID))
+    if not ch:
+        return
+
+    try:
+        e = daily_picks_embed(top10)
+        await ch.send(embed=e)
+        _LAST_DAILY_PICKS_DATE = today_key
+    except Exception:
+        return
 
 # ------------- Settlement loop -------------
 @tasks.loop(minutes=10)
@@ -793,7 +848,7 @@ async def settle_loop():
             except Exception:
                 continue
 
-# ------------- Example background loop (optional) -------------
+# ------------- Example background loop -------------
 @tasks.loop(minutes=5)
 async def bet_loop():
     if not ODDS_API_KEY:
@@ -819,12 +874,11 @@ async def on_connect():
         bet_loop.start()
     if not settle_loop.is_running():
         settle_loop.start()
+    if not daily_picks_loop.is_running():
+        daily_picks_loop.start()
 
 # ------------- RUN -------------
 if not TOKEN:
     raise SystemExit("❌ Missing DISCORD_BOT_TOKEN")
 
 bot.run(TOKEN)
-
-
-
