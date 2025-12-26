@@ -1,15 +1,11 @@
 # bot.py
 import os
-import json
-import math
-import time
-import random
 import asyncio
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 import discord
-from discord import app_commands, Interaction, Embed, Color
+from discord import Interaction, Embed, Color
 from discord.ext import commands, tasks
 
 import psycopg2
@@ -19,26 +15,22 @@ import requests
 # ------------- ENV -------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
-QUICK_RETURNS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_QUICK", "0"))
-LONG_PLAYS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_LONG", "0"))
-VALUE_DUP_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_VALUE", "0"))  # optional
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip() or os.getenv("THEODDS_API_KEY", "").strip()
 
-# Postgres connection (prefer DATABASE_URL, else DATABASE_PUBLIC_URL)
 DATABASE_URL = (
     os.getenv("DATABASE_URL", "").strip()
     or os.getenv("DATABASE_PUBLIC_URL", "").strip()
 )
 
 # ------------- CONSTANTS -------------
-BANKROLL_UNITS = 1000.0                  # “units” bankroll notion (not currency)
-CONSERVATIVE_PCT = 0.015                 # 1.5% conservative
-VALUE_EDGE_THRESHOLD = 2.0               # remove all "low value" bets (< 2% edge)
+BANKROLL_UNITS = 1000.0
+CONSERVATIVE_PCT = 0.015
+VALUE_EDGE_THRESHOLD = 2.0
 
 # Daily Picks channel (hard-coded)
 DAILY_PICKS_CHANNEL_ID = 1454041180336554116
 
-# Perth timezone for scheduling (UTC+08)
+# Perth timezone (UTC+08)
 PERTH_TZ = timezone(timedelta(hours=8))
 
 BOOKMAKER_WHITELIST = {
@@ -46,7 +38,7 @@ BOOKMAKER_WHITELIST = {
     "pointsbet", "dabble", "betfair", "tab"
 }
 
-# --- Bookmaker → Discord channel routing (duplicate posts to selected app channels) ---
+# --- Bookmaker → Discord channel routing ---
 BOOKMAKER_CHANNEL_IDS = {
     "tabtouch": 1452828790567993415,
     "sportsbet": 1452828858658324596,
@@ -74,7 +66,6 @@ def _normalize_bookmaker(name: str) -> str:
     }
     return aliases.get(n, n)
 
-# Sport emoji + league name mapper (league fallback “Unknown League”)
 SPORT_EMOJI = {
     "soccer": "⚽",
     "basketball": "🏀",
@@ -91,10 +82,7 @@ SPORT_EMOJI = {
     "rugbynunion": "🏉",
 }
 
-# In-memory index of posted bets so our buttons know what to save
 POSTED_BETS: dict[str, dict] = {}
-
-# In-memory guard so Daily Picks only posts once per day (Perth date)
 _LAST_DAILY_PICKS_DATE: str | None = None
 
 # ------------- DB HELPERS -------------
@@ -104,7 +92,6 @@ def get_db_conn():
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def ensure_schema():
-    """Create tables if missing and ensure all expected columns exist."""
     if not DATABASE_URL:
         return
     conn = get_db_conn()
@@ -291,7 +278,7 @@ def db_settle_user_bet(user_bet_id: int, result: str, pnl_units: float):
     conn.commit()
     cur.close(); conn.close()
 
-# ------------- ODDS FETCH (TheOddsAPI) -------------
+# ------------- ODDS FETCH -------------
 def allowed_book(title: str) -> bool:
     return any(k in (title or "").lower() for k in BOOKMAKER_WHITELIST)
 
@@ -325,45 +312,6 @@ def theodds_fetch_scores(sport_key: str, days_from: int = 7):
         return r.json()
     except Exception:
         return []
-
-def _parse_score_value(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-def _event_scores_map(scores_payload: list[dict]) -> dict:
-    out = {}
-    for ev in scores_payload or []:
-        eid = ev.get("id")
-        if not eid:
-            continue
-        completed = bool(ev.get("completed"))
-        home = ev.get("home_team") or ""
-        away = ev.get("away_team") or ""
-        hs = None
-        as_ = None
-
-        scores = ev.get("scores") or []
-        if isinstance(scores, list):
-            for s in scores:
-                nm = (s.get("name") or "").strip()
-                sc = _parse_score_value(s.get("score"))
-                if not nm:
-                    continue
-                if nm == home:
-                    hs = sc
-                elif nm == away:
-                    as_ = sc
-
-        out[eid] = {
-            "completed": completed,
-            "home_team": home,
-            "away_team": away,
-            "home_score": hs,
-            "away_score": as_,
-        }
-    return out
 
 def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, home_score: float, away_score: float):
     market = (market or "").lower()
@@ -418,8 +366,46 @@ def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, 
 
     return None
 
+def _parse_score_value(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _event_scores_map(scores_payload: list[dict]) -> dict:
+    out = {}
+    for ev in scores_payload or []:
+        eid = ev.get("id")
+        if not eid:
+            continue
+        completed = bool(ev.get("completed"))
+        home = ev.get("home_team") or ""
+        away = ev.get("away_team") or ""
+        hs = None
+        as_ = None
+
+        scores = ev.get("scores") or []
+        if isinstance(scores, list):
+            for s in scores:
+                nm = (s.get("name") or "").strip()
+                sc = _parse_score_value(s.get("score"))
+                if not nm:
+                    continue
+                if nm == home:
+                    hs = sc
+                elif nm == away:
+                    as_ = sc
+
+        out[eid] = {
+            "completed": completed,
+            "home_team": home,
+            "away_team": away,
+            "home_score": hs,
+            "away_score": as_,
+        }
+    return out
+
 def compute_bets_from_payload(payload):
-    """Compute bets & classifications; filters out low-value bets."""
     now = datetime.now(timezone.utc)
     results = []
     for ev in payload:
@@ -448,7 +434,7 @@ def compute_bets_from_payload(payload):
                 for oc in m.get("outcomes", []):
                     nm = oc.get("name"); pr = oc.get("price")
                     if nm and pr:
-                        cs_map[f"{mk}:{nm}"].append(1/float(pr))
+                        cs_map[f"{mk}:{nm}"].append(1 / float(pr))
 
         if not cs_map:
             continue
@@ -465,22 +451,18 @@ def compute_bets_from_payload(payload):
                     nm = oc.get("name"); pr = oc.get("price")
                     if not nm or not pr:
                         continue
-                    implied = 1/float(pr)
+
+                    implied = 1 / float(pr)
                     keyo = f"{mk}:{nm}"
-                    consensus = (sum(cs_map[keyo])/len(cs_map[keyo])) if keyo in cs_map else global_c
+                    consensus = (sum(cs_map[keyo]) / len(cs_map[keyo])) if keyo in cs_map else global_c
                     edge = (consensus - implied) * 100.0
 
                     if edge < VALUE_EDGE_THRESHOLD:
                         continue
 
-                    delta = dt - now
-                    quick = (delta <= timedelta(hours=48))
-                    longp = (delta > timedelta(hours=48))
-                    category = "quick" if quick else "long" if longp else "other"
-
-                    conservative_units = round(BANKROLL_UNITS*CONSERVATIVE_PCT, 2)
-                    smart_units = round(conservative_units * max(1.0, (consensus*100)/50.0), 2)
-                    aggressive_units = round(conservative_units * (1 + (edge/10.0)), 2)
+                    conservative_units = round(BANKROLL_UNITS * CONSERVATIVE_PCT, 2)
+                    smart_units = round(conservative_units * max(1.0, (consensus * 100) / 50.0), 2)
+                    aggressive_units = round(conservative_units * (1 + (edge / 10.0)), 2)
 
                     bet_key = f"{match_name}|{mk}|{nm}|{bk['title']}|{dt.isoformat()}"
 
@@ -492,12 +474,9 @@ def compute_bets_from_payload(payload):
                         "team": nm,
                         "odds": float(pr),
                         "edge": round(edge, 2),
-                        "probability": round(consensus*100, 2),
-                        "consensus": round(consensus*100, 2),
+                        "consensus": round(consensus * 100, 2),
                         "bet_time": dt,
-                        "category": category,
-                        "quick_return": quick,
-                        "long_play": longp,
+                        "category": "best",
                         "sport": sport_key or "unknown",
                         "league": league,
                         "emoji": sport_emoji,
@@ -511,11 +490,7 @@ def compute_bets_from_payload(payload):
     return results
 
 # ------------- EMBEDS + BUTTONS -------------
-def value_indicator(edge_pct: float) -> str:
-    return "🟢 Value Bet"
-
 def bet_embed(bet: dict, title: str, color: int) -> Embed:
-    ind = value_indicator(bet["edge"])
     sport_line = f"{bet['emoji']} {bet['sport'].title()} ({bet.get('league') or 'Unknown League'})"
 
     market = (bet.get("market") or "").lower()
@@ -532,14 +507,14 @@ def bet_embed(bet: dict, title: str, color: int) -> Embed:
         market_line = f"\n**Market:** {market.upper()}"
 
     desc = (
-        f"{ind}\n\n"
+        f"🟢 Value Bet\n\n"
         f"**{sport_line}**\n\n"
         f"**Match:** {bet['match']}\n"
         f"**Pick:** {bet['team']} @ {bet['odds']}\n"
         f"**Bookmaker:** {bet['bookmaker']}"
         f"{market_line}\n"
         f"**Consensus %:** {bet['consensus']}%\n"
-        f"**Implied %:** {round((1/bet['odds'])*100,2)}%\n"
+        f"**Implied %:** {round((1 / bet['odds']) * 100, 2)}%\n"
         f"**Edge:** {bet['edge']}%\n"
         f"**Time:** {bet['bet_time'].strftime('%d/%m/%y %H:%M')}\n\n"
         f"💵 **Conservative Stake:** {bet['conservative_units']} units\n"
@@ -565,8 +540,7 @@ def daily_picks_embed(bets: list[dict]) -> Embed:
             f"• Edge: **{b['edge']}%** • Starts: **{when}**\n"
         )
 
-    desc = "\n".join(lines)
-    e = Embed(title=title, description=desc, color=Color.blurple().value)
+    e = Embed(title=title, description="\n".join(lines), color=Color.blurple().value)
     e.set_footer(text="Top 10 highest-edge value bets currently available.")
     return e
 
@@ -634,12 +608,10 @@ async def on_ready():
         bot.synced = True
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
-# -------- /ping ----------
 @bot.tree.command(name="ping", description="Check bot latency.")
 async def ping_cmd(interaction: Interaction):
-    await interaction.response.send_message(f"Pong! {round(bot.latency*1000)}ms", ephemeral=True)
+    await interaction.response.send_message(f"Pong! {round(bot.latency * 1000)}ms", ephemeral=True)
 
-# -------- /fetchbets ----
 @bot.tree.command(name="fetchbets", description="Manually fetch a preview of incoming bets.")
 async def fetchbets_cmd(interaction: Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -657,7 +629,6 @@ async def fetchbets_cmd(interaction: Interaction):
         lines.append(f"**{b['match']}** · {b['team']} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%")
     await interaction.followup.send("🎲 Bets Preview:\n" + "\n".join(lines), ephemeral=True)
 
-# -------- /roi (system-wide) ----
 @bot.tree.command(name="roi", description="System-wide ROI (all recorded user paper trades).")
 async def roi_cmd(interaction: Interaction):
     agg = db_agg_total()
@@ -674,7 +645,6 @@ async def roi_cmd(interaction: Interaction):
            f"- Settled bets: {agg['settled']}")
     await interaction.response.send_message(msg, ephemeral=True)
 
-# -------- /stats (personal) ----
 @bot.tree.command(name="stats", description="Your personal paper-trading stats.")
 async def stats_cmd(interaction: Interaction):
     agg = db_agg_user(interaction.user.id)
@@ -693,18 +663,9 @@ async def stats_cmd(interaction: Interaction):
 
 # ------------- Posting helpers -------------
 async def post_bet_to_channels(bet: dict):
-    channel_id = BEST_BETS_CHANNEL
+    """Everything posts to Best Bets, and duplicates into the correct bookmaker channel. No more VALUE_DUP (testing)."""
     title = "⭐ Best Bet"
     color = Color.gold().value
-
-    if bet.get("quick_return"):
-        channel_id = QUICK_RETURNS_CHANNEL
-        title = "⏱ Quick Return Bet"
-        color = 0x2ECC71
-    elif bet.get("long_play"):
-        channel_id = LONG_PLAYS_CHANNEL
-        title = "📅 Longer Play Bet"
-        color = 0x3498DB
 
     e = bet_embed(bet, title, color)
     view = StakeButtons(bet["bet_key"])
@@ -716,8 +677,8 @@ async def post_bet_to_channels(bet: dict):
     except Exception:
         pass
 
-    if channel_id:
-        ch = bot.get_channel(channel_id)
+    if BEST_BETS_CHANNEL:
+        ch = bot.get_channel(BEST_BETS_CHANNEL)
         if ch:
             await ch.send(embed=e, view=view)
 
@@ -728,24 +689,13 @@ async def post_bet_to_channels(bet: dict):
         if bm_channel_id:
             bm_ch = bot.get_channel(int(bm_channel_id))
             if bm_ch:
-                e_bm = bet_embed(bet, title, color)
-                await bm_ch.send(embed=e_bm, view=StakeButtons(bet["bet_key"]))
+                await bm_ch.send(embed=bet_embed(bet, title, color), view=StakeButtons(bet["bet_key"]))
     except Exception:
         pass
 
-    if VALUE_DUP_CHANNEL:
-        ch2 = bot.get_channel(VALUE_DUP_CHANNEL)
-        if ch2:
-            e2 = bet_embed(bet, "⭐ Value Bet (Testing)", Color.green().value)
-            await ch2.send(embed=e2, view=StakeButtons(bet["bet_key"]))
-
-# ------------- Daily Picks loop (top 10 by edge, at 12:00pm Perth time daily) -------------
+# ------------- Daily Picks loop (12:00pm Perth daily) -------------
 @tasks.loop(minutes=1)
 async def daily_picks_loop():
-    """
-    Posts once per Perth day at 12:00pm (noon) Perth time.
-    Loop runs every minute, and uses a small window (12:00-12:04) so it still posts if the bot lags/restarts.
-    """
     global _LAST_DAILY_PICKS_DATE
 
     if not ODDS_API_KEY:
@@ -754,11 +704,10 @@ async def daily_picks_loop():
     now_perth = datetime.now(PERTH_TZ)
     today_key = now_perth.strftime("%Y-%m-%d")
 
-    # Only post once per day
     if _LAST_DAILY_PICKS_DATE == today_key:
         return
 
-    # Only post at 12:00pm Perth time (allow a small window)
+    # Post at 12:00pm Perth time (allow 12:00–12:04)
     if not (now_perth.hour == 12 and 0 <= now_perth.minute <= 4):
         return
 
@@ -778,8 +727,7 @@ async def daily_picks_loop():
         return
 
     try:
-        e = daily_picks_embed(top10)
-        await ch.send(embed=e)
+        await ch.send(embed=daily_picks_embed(top10))
         _LAST_DAILY_PICKS_DATE = today_key
     except Exception:
         return
@@ -848,7 +796,7 @@ async def settle_loop():
             except Exception:
                 continue
 
-# ------------- Example background loop -------------
+# ------------- Bet loop -------------
 @tasks.loop(minutes=5)
 async def bet_loop():
     if not ODDS_API_KEY:
