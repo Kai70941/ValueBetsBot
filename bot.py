@@ -39,6 +39,34 @@ BOOKMAKER_WHITELIST = {
     "pointsbet", "dabble", "betfair", "tab"
 }
 
+# --- Bookmaker → Discord channel routing (duplicate posts to selected app channels) ---
+BOOKMAKER_CHANNEL_IDS = {
+    "tabtouch": 1452828790567993415,
+    "sportsbet": 1452828858658324596,
+    "bet365": 1452828976060956753,
+    "neds": 1452829020306800681,
+    "ladbrokes": 1452829097440055306,
+    "pointsbet": 1452829191945981963,
+    "tab": 1452829245490335967,
+    "betfair": 1452829323747659849,
+}
+
+def _normalize_bookmaker(name: str) -> str:
+    if not name:
+        return ""
+    n = name.strip().lower()
+    aliases = {
+        "tab touch": "tabtouch",
+        "tab-touch": "tabtouch",
+        "tabtouch": "tabtouch",
+        "tab": "tab",
+        "bet 365": "bet365",
+        "bet-365": "bet365",
+        "points bet": "pointsbet",
+        "pointbet": "pointsbet",
+    }
+    return aliases.get(n, n)
+
 # Sport emoji + league name mapper (league fallback “Unknown League”)
 SPORT_EMOJI = {
     "soccer": "⚽",
@@ -136,7 +164,7 @@ def ensure_schema():
 
 def save_bet_row(bet: dict):
     """Insert the bet in bets table (ignore if exists)."""
-    if not DATABASE_URL: 
+    if not DATABASE_URL:
         return
     conn = get_db_conn()
     cur = conn.cursor()
@@ -237,7 +265,7 @@ def compute_bets_from_payload(payload):
     results = []
     for ev in payload:
         home = ev.get("home_team"); away = ev.get("away_team")
-        if not home or not away: 
+        if not home or not away:
             continue
         match_name = f"{home} vs {away}"
         commence = ev.get("commence_time")
@@ -272,7 +300,7 @@ def compute_bets_from_payload(payload):
 
         # each offered
         for bk in ev.get("bookmakers", []):
-            if not allowed_book(bk.get("title", "")): 
+            if not allowed_book(bk.get("title", "")):
                 continue
             for m in bk.get("markets", []):
                 for oc in m.get("outcomes", []):
@@ -502,6 +530,18 @@ async def post_bet_to_channels(bet: dict):
         ch = bot.get_channel(channel_id)
         if ch:
             await ch.send(embed=e, view=view)
+
+    # duplicate to the appropriate bookmaker channel (your requested change)
+    try:
+        bm_key = _normalize_bookmaker(bet.get("bookmaker", ""))
+        bm_channel_id = BOOKMAKER_CHANNEL_IDS.get(bm_key)
+        if bm_channel_id:
+            bm_ch = bot.get_channel(int(bm_channel_id))
+            if bm_ch:
+                # use a fresh View instance for this message
+                await bm_ch.send(embed=e, view=StakeButtons(bet["bet_key"]))
+    except Exception:
+        pass
 
     # duplicate Value channel (testing)
     if VALUE_DUP_CHANNEL:
