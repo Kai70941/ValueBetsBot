@@ -33,6 +33,8 @@ DATABASE_URL = (
 # ------------- CONSTANTS -------------
 BANKROLL_UNITS = 1000.0                  # “units” bankroll notion (not currency)
 CONSERVATIVE_PCT = 0.015                 # 1.5% conservative
+VALUE_EDGE_THRESHOLD = 2.0               # remove all "low value" bets (< 2% edge)
+
 BOOKMAKER_WHITELIST = {
     # Your 9 AU/UK books
     "sportsbet", "bet365", "ladbrokes", "tabtouch", "neds",
@@ -148,7 +150,7 @@ def ensure_schema():
         ("user_bets", "settled_at", "TIMESTAMPTZ"),
         ("user_bets", "league", "TEXT"),
 
-        # NEW: needed for settlement of spreads/totals too
+        # settlement fields
         ("bets", "market", "TEXT"),
         ("bets", "point", "NUMERIC"),
         ("user_bets", "market", "TEXT"),
@@ -336,10 +338,6 @@ def _parse_score_value(x):
         return None
 
 def _event_scores_map(scores_payload: list[dict]) -> dict:
-    """
-    Build map: event_id -> dict with home, away, home_score, away_score, completed
-    TheOddsAPI scores payload usually includes: id, home_team, away_team, completed, scores:[{name,score},...]
-    """
     out = {}
     for ev in scores_payload or []:
         eid = ev.get("id")
@@ -373,24 +371,18 @@ def _event_scores_map(scores_payload: list[dict]) -> dict:
     return out
 
 def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, home_score: float, away_score: float):
-    """
-    Returns: 'win'|'loss'|'void'|None
-    Supports: h2h, totals, spreads
-    """
     market = (market or "").lower()
     team_norm = (team or "").strip().lower()
 
     if home_score is None or away_score is None:
         return None
 
-    # H2H
     if market == "h2h":
         if home_score == away_score:
             return "void"
         winner = home_team if home_score > away_score else away_team
         return "win" if team.strip().lower() == winner.strip().lower() else "loss"
 
-    # TOTALS
     if market == "totals":
         if point is None:
             return None
@@ -407,7 +399,6 @@ def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, 
             return "win" if total < line else "loss"
         return None
 
-    # SPREADS
     if market == "spreads":
         if point is None:
             return None
@@ -416,7 +407,6 @@ def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, 
         except Exception:
             return None
 
-        # outcome name is usually the team; apply spread to that team's score
         if team.strip().lower() == home_team.strip().lower():
             adj = home_score + spread
             if abs(adj - away_score) < 1e-9:
@@ -431,11 +421,10 @@ def _settle_calc(market: str, team: str, point, home_team: str, away_team: str, 
 
         return None
 
-    # Unknown market
     return None
 
 def compute_bets_from_payload(payload):
-    """Very similar to what you had — compute bets & classifications."""
+    """Compute bets & classifications; filters out low-value bets."""
     now = datetime.now(timezone.utc)
     results = []
     for ev in payload:
@@ -451,29 +440,27 @@ def compute_bets_from_payload(payload):
         if dt <= now or dt > now + timedelta(days=150):
             continue
 
-        # sport key + league try from event
         sport_key = (ev.get("sport_key") or "").lower()
         league = ev.get("sport_title") or ev.get("sport_title_long") or "Unknown League"
         sport_emoji = SPORT_EMOJI.get(sport_key, "🎲")
 
-        # consensus from allowed books
         cs_map = defaultdict(list)
         for bk in ev.get("bookmakers", []):
             if not allowed_book(bk.get("title", "")):
                 continue
             for m in bk.get("markets", []):
+                mk = m.get("key") or ""
                 for oc in m.get("outcomes", []):
                     nm = oc.get("name"); pr = oc.get("price")
                     if nm and pr:
-                        cs_map[f"{m['key']}:{nm}"].append(1/float(pr))
+                        cs_map[f"{mk}:{nm}"].append(1/float(pr))
 
         if not cs_map:
             continue
-        # global consensus fallback
+
         tot_ps = [p for arr in cs_map.values() for p in arr]
         global_c = sum(tot_ps) / max(1, len(tot_ps))
 
-        # each offered
         for bk in ev.get("bookmakers", []):
             if not allowed_book(bk.get("title", "")):
                 continue
@@ -487,16 +474,16 @@ def compute_bets_from_payload(payload):
                     keyo = f"{mk}:{nm}"
                     consensus = (sum(cs_map[keyo])/len(cs_map[keyo])) if keyo in cs_map else global_c
                     edge = (consensus - implied) * 100.0
-                    if edge <= 0:
+
+                    # ✅ REMOVE ALL LOW VALUE BETS
+                    if edge < VALUE_EDGE_THRESHOLD:
                         continue
 
-                    # classification
                     delta = dt - now
                     quick = (delta <= timedelta(hours=48))
                     longp = (delta > timedelta(hours=48))
                     category = "quick" if quick else "long" if longp else "other"
 
-                    # stake units
                     conservative_units = round(BANKROLL_UNITS*CONSERVATIVE_PCT, 2)
                     smart_units = round(conservative_units * max(1.0, (consensus*100)/50.0), 2)
                     aggressive_units = round(conservative_units * (1 + (edge/10.0)), 2)
@@ -523,17 +510,16 @@ def compute_bets_from_payload(payload):
                         "conservative_units": conservative_units,
                         "smart_units": smart_units,
                         "aggressive_units": aggressive_units,
-
-                        # NEW: settlement fields
                         "market": mk,
-                        "point": oc.get("point"),  # for spreads/totals (None for h2h)
+                        "point": oc.get("point"),
                     }
                     results.append(bet)
     return results
 
 # ------------- EMBEDS + BUTTONS -------------
 def value_indicator(edge_pct: float) -> str:
-    return "🟢 Value Bet" if edge_pct >= 2 else "🛑 Low Value"
+    # With filtering enabled, this will almost always be value.
+    return "🟢 Value Bet"
 
 def bet_embed(bet: dict, title: str, color: int) -> Embed:
     ind = value_indicator(bet["edge"])
@@ -545,7 +531,10 @@ def bet_embed(bet: dict, title: str, color: int) -> Embed:
     if market == "totals" and point is not None:
         market_line = f"\n**Market:** Totals ({bet['team']} {point})"
     elif market == "spreads" and point is not None:
-        market_line = f"\n**Market:** Spreads ({bet['team']} {point:+})"
+        try:
+            market_line = f"\n**Market:** Spreads ({bet['team']} {float(point):+})"
+        except Exception:
+            market_line = f"\n**Market:** Spreads ({bet['team']} {point})"
     elif market:
         market_line = f"\n**Market:** {market.upper()}"
 
@@ -689,7 +678,7 @@ async def stats_cmd(interaction: Interaction):
            f"- Settled bets: {agg['settled']}")
     await interaction.response.send_message(msg, ephemeral=True)
 
-# ------------- Posting helpers (used by your loop or elsewhere) -------------
+# ------------- Posting helpers -------------
 async def post_bet_to_channels(bet: dict):
     """Posts a single bet embed with buttons; duplicates to app-specific channel; duplicates to VALUE_DUP_CHANNEL if configured."""
     channel_id = BEST_BETS_CHANNEL
@@ -715,19 +704,22 @@ async def post_bet_to_channels(bet: dict):
     except Exception:
         pass
 
+    # main channel (Best Bets stays in Best Bets)
     if channel_id:
         ch = bot.get_channel(channel_id)
         if ch:
             await ch.send(embed=e, view=view)
 
-    # duplicate to the appropriate bookmaker channel
+    # ✅ duplicate to the appropriate bookmaker channel (Best Bets will also duplicate)
     try:
         bm_key = _normalize_bookmaker(bet.get("bookmaker", ""))
         bm_channel_id = BOOKMAKER_CHANNEL_IDS.get(bm_key)
         if bm_channel_id:
             bm_ch = bot.get_channel(int(bm_channel_id))
             if bm_ch:
-                await bm_ch.send(embed=e, view=StakeButtons(bet["bet_key"]))
+                # fresh embed + fresh view instance
+                e_bm = bet_embed(bet, title, color)
+                await bm_ch.send(embed=e_bm, view=StakeButtons(bet["bet_key"]))
     except Exception:
         pass
 
@@ -747,15 +739,16 @@ async def settle_loop():
     if not unsettled:
         return
 
-    # group by sport to minimize API calls
     by_sport = defaultdict(list)
     for row in unsettled:
         sport_key = (row.get("sport") or "").lower()
-        # only attempt settlement after start time
         bt = row.get("bet_time")
         if isinstance(bt, datetime):
-            if bt.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
-                continue
+            try:
+                if bt.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+                    continue
+            except Exception:
+                pass
         if sport_key:
             by_sport[sport_key].append(row)
 
@@ -783,7 +776,6 @@ async def settle_loop():
 
             result = _settle_calc(market, team, point, ev["home_team"], ev["away_team"], hs, aw)
             if result is None:
-                # can't determine; skip for now
                 continue
 
             stake = float(r.get("stake_units") or 0.0)
@@ -793,7 +785,7 @@ async def settle_loop():
                 pnl = stake * (odds - 1.0)
             elif result == "loss":
                 pnl = -stake
-            else:  # void
+            else:
                 pnl = 0.0
 
             try:
