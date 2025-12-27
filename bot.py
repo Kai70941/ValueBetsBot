@@ -18,7 +18,7 @@ import requests
 # =========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
-# Channels
+# Core channels
 BEST_BETS_CHANNEL = int(os.getenv("DISCORD_CHANNEL_ID_BEST", "0"))
 
 # Daily Picks (12pm Perth)
@@ -54,9 +54,9 @@ MAX_EVENT_DAYS = int(os.getenv("MAX_EVENT_DAYS", "150"))
 MATCHED_ENABLED = os.getenv("MATCHED_ENABLED", "1").strip() != "0"
 MATCHED_INTERVAL_MIN = int(os.getenv("MATCHED_INTERVAL_MINUTES", "30"))
 MATCHED_MAX_POSTS_PER_RUN = int(os.getenv("MATCHED_MAX_POSTS_PER_RUN", "8"))
-EST_LAY_OFFSET = float(os.getenv("EST_LAY_OFFSET", "0.03"))  # lay approx = back_odds - offset
-EST_LAY_RANGE = float(os.getenv("EST_LAY_RANGE", "0.06"))   # +/- range displayed
-EXCHANGE_COMMISSION = float(os.getenv("EXCHANGE_COMMISSION", "0.02"))  # 2%
+EST_LAY_OFFSET = float(os.getenv("EST_LAY_OFFSET", "0.03"))
+EST_LAY_RANGE = float(os.getenv("EST_LAY_RANGE", "0.06"))
+EXCHANGE_COMMISSION = float(os.getenv("EXCHANGE_COMMISSION", "0.02"))
 
 # Default promo stake used for preview examples
 DEFAULT_PROMO_STAKE = float(os.getenv("MATCHED_DEFAULT_STAKE", "50"))
@@ -303,10 +303,7 @@ def theodds_fetch_upcoming():
 
 
 def theodds_fetch_scores(days_from: int = 3):
-    """
-    Fetch scores for completed events.
-    TheOddsAPI scores endpoint.
-    """
+    """Fetch scores for completed events."""
     url = "https://api.the-odds-api.com/v4/sports/upcoming/scores/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -326,6 +323,8 @@ def compute_bets_from_payload(payload):
     Compute value bets:
     - consensus implied probability vs offered implied probability
     - only keep edge >= MIN_EDGE_PCT
+
+    ✅ CHANGE: include outcome 'point' for totals/spreads and include it in keys
     """
     now = datetime.now(timezone.utc)
     results = []
@@ -357,9 +356,11 @@ def compute_bets_from_payload(payload):
             for m in bk.get("markets", []):
                 for oc in m.get("outcomes", []):
                     nm = oc.get("name"); pr = oc.get("price")
+                    pt = oc.get("point")  # ✅ NEW
                     if nm and pr:
                         try:
-                            cs_map[f"{m['key']}:{nm}"].append(1 / float(pr))
+                            # ✅ include point in consensus key so totals/spreads match correctly
+                            cs_map[f"{m['key']}:{nm}:{pt}"].append(1 / float(pr))
                         except Exception:
                             continue
 
@@ -375,6 +376,7 @@ def compute_bets_from_payload(payload):
             for m in bk.get("markets", []):
                 for oc in m.get("outcomes", []):
                     nm = oc.get("name"); pr = oc.get("price")
+                    pt = oc.get("point")  # ✅ NEW
                     if not nm or not pr:
                         continue
                     try:
@@ -383,11 +385,11 @@ def compute_bets_from_payload(payload):
                     except Exception:
                         continue
 
-                    keyo = f"{m['key']}:{nm}"
+                    # ✅ include point in consensus lookup key
+                    keyo = f"{m['key']}:{nm}:{pt}"
                     consensus = (sum(cs_map[keyo]) / len(cs_map[keyo])) if keyo in cs_map else global_c
                     edge = (consensus - implied) * 100.0
 
-                    # remove low-value bets
                     if edge < MIN_EDGE_PCT:
                         continue
 
@@ -395,14 +397,16 @@ def compute_bets_from_payload(payload):
                     smart_units = round(conservative_units * max(1.0, (consensus * 100) / 50.0), 2)
                     aggressive_units = round(conservative_units * (1 + (edge / 10.0)), 2)
 
-                    bet_key = f"{match_name}|{nm}|{bk['title']}|{dt.isoformat()}|{m.get('key','')}"
+                    # ✅ include point in bet_key so lines don't collide (e.g. Under 224.5 vs Under 225.5)
+                    bet_key = f"{match_name}|{nm}|{pt}|{bk['title']}|{dt.isoformat()}|{m.get('key','')}"
+
                     results.append({
                         "event_id": ev.get("id") or bet_key,
                         "bet_key": bet_key,
                         "match": match_name,
                         "bookmaker": bk.get("title", "Unknown"),
                         "bookmaker_key": (bk.get("key") or bk.get("title", "")).lower(),
-                        "team": nm,
+                        "team": nm,           # "Under"/"Over" for totals, team name for h2h/spreads
                         "odds": pr_f,
                         "edge": round(edge, 2),
                         "consensus": round(consensus * 100, 2),
@@ -414,7 +418,8 @@ def compute_bets_from_payload(payload):
                         "conservative_units": conservative_units,
                         "smart_units": smart_units,
                         "aggressive_units": aggressive_units,
-                        "market": m.get("key", "unknown")
+                        "market": m.get("key", "unknown"),
+                        "point": pt,          # ✅ NEW
                     })
 
     return results
@@ -424,15 +429,36 @@ def compute_bets_from_payload(payload):
 # EMBEDS + BUTTONS
 # =========================
 def bet_embed(bet: dict, title: str, color: int) -> Embed:
+    """
+    ✅ CHANGE: format totals/spreads with the point line.
+      - totals: Under 224.5 @ 1.88
+      - spreads: Detroit Pistons +5.5 @ 1.91
+    """
     sport_line = f"{bet['emoji']} {bet['sport'].title()} ({bet.get('league') or 'Unknown League'})"
     implied_pct = round((1 / bet["odds"]) * 100, 2)
+
+    market = (bet.get("market") or "").lower()
+    pt = bet.get("point")
+
+    # Build a clear pick string
+    if market == "totals" and pt is not None:
+        # team is "Under"/"Over"
+        pick_str = f"{bet['team']} {pt}"
+    elif market == "spreads" and pt is not None:
+        # team is usually the side name, pt is +/- line
+        try:
+            pick_str = f"{bet['team']} {float(pt):+g}"
+        except Exception:
+            pick_str = f"{bet['team']} {pt}"
+    else:
+        pick_str = bet["team"]
 
     desc = (
         f"🟢 **Value Bet** (edge ≥ {MIN_EDGE_PCT:.1f}%)\n\n"
         f"**{sport_line}**\n\n"
         f"**Match:** {bet['match']}\n"
         f"**Market:** {bet.get('market','h2h')}\n"
-        f"**Pick:** {bet['team']} @ {bet['odds']}\n"
+        f"**Pick:** {pick_str} @ {bet['odds']}\n"
         f"**Bookmaker:** {bet['bookmaker']}\n"
         f"**Consensus %:** {bet['consensus']}%\n"
         f"**Implied %:** {implied_pct}%\n"
@@ -495,20 +521,11 @@ class StakeButtons(discord.ui.View):
 
 
 def matched_bet_embed(bet: dict) -> Embed:
-    """
-    Matched bet preview WITHOUT exchange odds:
-    - show suggested back stake
-    - show estimated lay odds range
-    - warn to confirm lay odds manually
-    """
     back_odds = float(bet["odds"])
     est_lay = max(1.01, round(back_odds - EST_LAY_OFFSET, 2))
     lay_low = max(1.01, round(est_lay - EST_LAY_RANGE, 2))
     lay_high = max(1.01, round(est_lay + EST_LAY_RANGE, 2))
 
-    # Simple “hedge” calc example (approx)
-    # Lay stake ≈ (BackStake * BackOdds) / (LayOdds - CommissionAdj)
-    # Commission applied to winnings on exchange; approximate by increasing lay stake slightly.
     back_stake = DEFAULT_PROMO_STAKE
     denom = max(1.01, est_lay - (EXCHANGE_COMMISSION * (est_lay - 1)))
     lay_stake = round((back_stake * back_odds) / denom, 2)
@@ -581,7 +598,13 @@ async def fetchbets_cmd(interaction: Interaction):
     bets.sort(key=lambda x: (x["edge"], x["consensus"]), reverse=True)
     lines = []
     for b in bets[:5]:
-        lines.append(f"**{b['match']}** · {b['team']} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%")
+        pt = b.get("point")
+        market = (b.get("market") or "").lower()
+        if market in ("totals", "spreads") and pt is not None:
+            pick = f"{b['team']} {pt}"
+        else:
+            pick = b["team"]
+        lines.append(f"**{b['match']}** · {pick} @ {b['odds']} ({b['bookmaker']}) | Edge: {b['edge']}%")
     await interaction.followup.send("🟢 Value Bets Preview:\n" + "\n".join(lines), ephemeral=True)
 
 
@@ -629,11 +652,7 @@ async def stats_cmd(interaction: Interaction):
 # POSTING HELPERS
 # =========================
 def normalize_bookmaker_key(book_title: str) -> str:
-    """
-    Convert bookmaker title into a key that matches BOOKMAKER_CHANNELS
-    """
     t = (book_title or "").lower().strip()
-    # common normalizations
     if "tabtouch" in t:
         return "tabtouch"
     if t == "tab" or "tab " in t or "tab-" in t:
@@ -662,10 +681,6 @@ async def send_to_channel(channel_id: int, embed: Embed, view: discord.ui.View |
 
 
 async def post_value_bet(bet: dict):
-    """
-    Posts a value bet to its bookmaker channel.
-    """
-    # index for buttons
     POSTED_BETS[bet["bet_key"]] = bet
     try:
         save_bet_row(bet)
@@ -682,10 +697,6 @@ async def post_value_bet(bet: dict):
 
 
 async def post_best_bet(best_bet: dict):
-    """
-    Posts best bet to BEST_BETS_CHANNEL
-    AND duplicates it into the correct bookmaker channel.
-    """
     POSTED_BETS[best_bet["bet_key"]] = best_bet
     try:
         save_bet_row(best_bet)
@@ -695,10 +706,8 @@ async def post_best_bet(best_bet: dict):
     view = StakeButtons(best_bet["bet_key"])
     embed_best = bet_embed(best_bet, "⭐ Best Bet", Color.gold().value)
 
-    # 1) Best bets channel
     await send_to_channel(BEST_BETS_CHANNEL, embed_best, view=view)
 
-    # 2) Duplicate into bookmaker channel
     bk_key = normalize_bookmaker_key(best_bet.get("bookmaker", ""))
     channel_id = BOOKMAKER_CHANNELS.get(bk_key)
     if channel_id:
@@ -706,9 +715,6 @@ async def post_best_bet(best_bet: dict):
 
 
 async def post_daily_picks(bets: list[dict]):
-    """
-    Posts top 10 highest-edge value bets into DAILY_PICKS_CHANNEL.
-    """
     if not DAILY_PICKS_CHANNEL:
         return
     if not bets:
@@ -720,9 +726,21 @@ async def post_daily_picks(bets: list[dict]):
     lines = []
     for i, b in enumerate(top10, start=1):
         perth_time = b["bet_time"].astimezone(PERTH_TZ).strftime("%d/%m %H:%M")
+        market = (b.get("market") or "").lower()
+        pt = b.get("point")
+        if market == "totals" and pt is not None:
+            pick = f"{b['team']} {pt}"
+        elif market == "spreads" and pt is not None:
+            try:
+                pick = f"{b['team']} {float(pt):+g}"
+            except Exception:
+                pick = f"{b['team']} {pt}"
+        else:
+            pick = b["team"]
+
         lines.append(
             f"**#{i}** {b['emoji']} **{b['match']}**\n"
-            f"• {b['team']} @ {b['odds']} (**{b['bookmaker']}**) | Edge: **{b['edge']}%** | {perth_time}\n"
+            f"• {pick} @ {b['odds']} (**{b['bookmaker']}**) | Edge: **{b['edge']}%** | {perth_time}\n"
         )
 
     e = Embed(
@@ -735,25 +753,16 @@ async def post_daily_picks(bets: list[dict]):
 
 
 async def post_matched_opportunities(bets: list[dict]):
-    """
-    Posts matched-bet preview opportunities (without exchange odds).
-    Uses a subset of strong value bets, typically higher odds/liquidity markets.
-    """
     if not MATCHED_ENABLED or not MATCHED_BETS_CHANNEL:
         return
     if not bets:
         return
 
-    # pick candidates: prefer H2H-ish and mid odds (more common for promos)
     candidates = []
     for b in bets:
         o = float(b["odds"])
         if o < 1.4 or o > 6.0:
             continue
-        # prefer h2h where possible
-        if (b.get("market") or "").lower() not in {"h2h", "head_to_head", "moneyline", "h2h_lay"}:
-            # still allow but de-prioritize
-            pass
         candidates.append(b)
 
     if not candidates:
@@ -806,17 +815,12 @@ def _upsert_event_result(event_id: str, sport_key: str, home: str, away: str, co
 
 
 def _settle_user_bets_for_event(event_id: str, winner_name: str | None, completed: bool):
-    """
-    Settle all user_bets rows for this event_id if result is NULL.
-    If winner_name is None, mark void when completed.
-    """
     if not DATABASE_URL or not completed:
         return
 
     conn = get_db_conn()
     cur = conn.cursor()
 
-    # get unsettled bets
     cur.execute("""
       SELECT id, bet_key, stake_units, odds
       FROM user_bets
@@ -832,15 +836,12 @@ def _settle_user_bets_for_event(event_id: str, winner_name: str | None, complete
         stake = float(r["stake_units"] or 0.0)
         odds = float(r["odds"] or 0.0)
 
-        # Determine pick from bet_key (format: match|team|book|time|market)
-        # This is consistent with how we build bet_key.
         parts = bet_key.split("|")
         pick = parts[1] if len(parts) > 1 else ""
 
         if not winner_name:
             result = "void"
         else:
-            # If winner matches pick: win else loss
             result = "win" if pick.strip().lower() == winner_name.strip().lower() else "loss"
 
         pnl = _calc_pnl(stake, odds, result)
@@ -857,9 +858,6 @@ def _settle_user_bets_for_event(event_id: str, winner_name: str | None, complete
 
 
 def process_scores_and_settle():
-    """
-    Pull recent scores from TheOddsAPI and settle any matching user_bets.
-    """
     if not ODDS_API_KEY or not DATABASE_URL:
         return
 
@@ -868,7 +866,6 @@ def process_scores_and_settle():
         return
 
     for ev in scores:
-        # Expected fields (TheOddsAPI): id, sport_key, commence_time, completed, home_team, away_team, scores, last_update
         event_id = ev.get("id")
         if not event_id:
             continue
@@ -884,8 +881,6 @@ def process_scores_and_settle():
         completed = bool(ev.get("completed", False))
 
         winner = None
-        # If completed, derive winner from scores if present
-        # TheOddsAPI often provides scores = [{"name": "Team", "score": "x"}, ...]
         if completed:
             sc = ev.get("scores")
             if isinstance(sc, list) and len(sc) >= 2:
@@ -899,7 +894,7 @@ def process_scores_and_settle():
                     elif sb > sa:
                         winner = b.get("name")
                     else:
-                        winner = None  # draw/void for our simple model
+                        winner = None
                 except Exception:
                     winner = None
 
@@ -912,13 +907,6 @@ def process_scores_and_settle():
 # =========================
 @tasks.loop(minutes=5)
 async def bet_loop():
-    """
-    Main loop:
-    - fetch value bets (edge >= MIN_EDGE_PCT)
-    - post ALL value bets to bookmaker channels
-    - post single best bet to BEST_BETS_CHANNEL + duplicate to bookmaker channel
-    - post matched opportunities (preview) periodically
-    """
     if not ODDS_API_KEY:
         return
 
@@ -930,18 +918,14 @@ async def bet_loop():
     if not bets:
         return
 
-    # Sort by strength
     bets.sort(key=lambda x: (x["edge"], x["consensus"]), reverse=True)
     best = bets[0]
 
-    # 1) post best bet (best bets channel + duplicate)
     try:
         await post_best_bet(best)
     except Exception:
         pass
 
-    # 2) post remaining value bets into their bookmaker channels
-    # (skip best to reduce spam duplicates)
     for b in bets[1:]:
         try:
             await post_value_bet(b)
@@ -949,16 +933,9 @@ async def bet_loop():
         except Exception:
             continue
 
-    # 3) matched bet opportunities (preview) — throttle by interval
-    # We'll post these in a separate loop to avoid spamming every 5 minutes.
-    # So nothing here.
-
 
 @tasks.loop(minutes=MATCHED_INTERVAL_MIN)
 async def matched_loop():
-    """
-    Periodic matched bet opportunity posts (preview mode).
-    """
     if not MATCHED_ENABLED or not ODDS_API_KEY:
         return
     payload = theodds_fetch_upcoming()
@@ -975,10 +952,6 @@ async def matched_loop():
 
 @tasks.loop(minutes=30)
 async def settlement_loop():
-    """
-    Auto-settle bets in DB using TheOddsAPI scores endpoint.
-    This is what makes /roi and /stats show profit/wins.
-    """
     try:
         process_scores_and_settle()
     except Exception:
@@ -987,11 +960,7 @@ async def settlement_loop():
 
 @tasks.loop(minutes=1)
 async def daily_picks_scheduler():
-    """
-    Scheduler that runs every minute, posts Daily Picks at 12:00 Perth time.
-    """
     now_perth = datetime.now(PERTH_TZ)
-    # exactly 12:00 perth time
     if now_perth.hour == 12 and now_perth.minute == 0:
         if not ODDS_API_KEY:
             return
@@ -1005,13 +974,11 @@ async def daily_picks_scheduler():
             await post_daily_picks(bets)
         except Exception:
             pass
-        # prevent double-posting within same minute window
         await asyncio.sleep(65)
 
 
 @bot.event
 async def on_connect():
-    # Start loops if not running
     if not bet_loop.is_running():
         bet_loop.start()
     if MATCHED_ENABLED and not matched_loop.is_running():
